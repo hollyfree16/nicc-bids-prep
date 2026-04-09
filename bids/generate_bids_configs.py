@@ -274,9 +274,11 @@ def assign_run_numbers(records):
 def bids_key(subject, session, folder, suffix):
     if folder in ("IGNORE", "UNKNOWN"):
         return folder
-    sub       = f"sub-{subject}"
-    ses_path  = f"/ses-{session}" if session else ""
-    ses_label = f"_ses-{session}" if session else ""
+    # Use heudiconv placeholders instead of hardcoded values
+    # so heudiconv can correctly template the output paths
+    sub       = "sub-{subject}"
+    ses_path  = "/ses-{session}" if session else ""
+    ses_label = "_ses-{session}" if session else ""
     return f"{sub}{ses_path}/{folder}/{sub}{ses_label}_{suffix}"
 
 

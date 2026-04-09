@@ -12,7 +12,7 @@ seen = set()
 results = []
 series_dirs = set()
 
-for f in glob.iglob(args.input_dir + '/*/*/*.dcm'):
+for f in glob.iglob(args.input_dir + '*/*.dcm'):
     series_dir = str(Path(f).parent)
     if series_dir in series_dirs:
         continue

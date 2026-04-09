@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 generate_bids_configs.py
 ========================
@@ -377,6 +377,8 @@ def main():
     parser.add_argument("--logs_dir",       required=True)
     parser.add_argument("--output_dir",     required=True)
     parser.add_argument("--site",           required=True)
+    parser.add_argument("--subject",        default=None, help="Process a single subject ID (e.g. CC001). Omit for batch processing.")
+    parser.add_argument("--session",        default=None, help="Process a single session (e.g. 001). Optional, used with --subject.")
     parser.add_argument("--templates_dir",
                         default=str(Path(__file__).resolve().parent / "templates"))
     parser.add_argument("--heuristic",      required=True, help="Path to heuristic.py")
@@ -394,12 +396,22 @@ def main():
     print(f"Templates dir: {templates_dir}")
     templates = load_templates(templates_dir, args.site)
 
-    log_files = sorted(logs_dir.glob("getSeriesDescription_sub-*.log"))
-    if not log_files:
-        log_files = sorted(logs_dir.glob("*sub-*.log"))
-    if not log_files:
-        print(f"ERROR: No log files found in {logs_dir}", file=sys.stderr)
-        sys.exit(1)
+    # Build file list — single subject or full batch
+    if args.subject:
+        pattern = f"*sub-{args.subject}*"
+        if args.session:
+            pattern = f"*sub-{args.subject}*ses-{args.session}*"
+        log_files = sorted(logs_dir.glob(pattern))
+        if not log_files:
+            print(f"ERROR: No log file found for subject {args.subject} in {logs_dir}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        log_files = sorted(logs_dir.glob("*sub-*.txt"))
+        if not log_files:
+            log_files = sorted(logs_dir.glob("*sub-*.log"))
+        if not log_files:
+            print(f"ERROR: No log files found in {logs_dir}", file=sys.stderr)
+            sys.exit(1)
 
     print(f"Log files    : {len(log_files)}")
     print(f"Output dir   : {output_dir}")

@@ -218,6 +218,19 @@ def resolve_series(series_list, template):
     folder_cf  = template["folder"]
     desc_cf    = {d.casefold(): d for d in series_list}
 
+    # Detect duplicate series names — all but the last occurrence are superseded.
+    # This handles cases where a sequence was aborted and rerun with the same name.
+    from collections import Counter
+    desc_counts = Counter(d.casefold() for d in series_list)
+    desc_seen   = Counter()
+
+    superseded_implicit = set()  # indices of non-last duplicates
+    for i, desc in enumerate(series_list):
+        cf = desc.casefold()
+        desc_seen[cf] += 1
+        if desc_counts[cf] > 1 and desc_seen[cf] < desc_counts[cf]:
+            superseded_implicit.add(i)
+
     superseded_cf = set()
     rerun_base_cf = {}
     for desc in series_list:
@@ -228,10 +241,13 @@ def resolve_series(series_list, template):
                 superseded_cf.add(base_cf)
 
     records = []
-    for desc in series_list:
+    for i, desc in enumerate(series_list):
         cf = desc.casefold()
         if always_ignore(desc):
             records.append(_rec(desc, "ignore", "IGNORE", "IGNORE", False, "always-ignore list"))
+            continue
+        if i in superseded_implicit:
+            records.append(_rec(desc, "superseded", "IGNORE", "IGNORE", False, "superseded by repeat acquisition"))
             continue
         if cf in superseded_cf:
             records.append(_rec(desc, "superseded", "IGNORE", "IGNORE", False, "superseded by rerun"))

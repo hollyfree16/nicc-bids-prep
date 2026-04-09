@@ -361,7 +361,7 @@ def parse_log(log_path):
 
 
 def parse_filename(log_path):
-    m = re.search(r"sub-(\w+)_ses-(\w+)", log_path.stem, re.IGNORECASE)
+    m = re.search(r"sub-([A-Za-z0-9]+)_ses-([A-Za-z0-9]+)", log_path.stem, re.IGNORECASE)
     if m:
         return m.group(1), m.group(2)
     m = re.search(r"sub-(\w+)", log_path.stem, re.IGNORECASE)

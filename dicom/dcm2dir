@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""
+dcm2dir (single-pass scan, deterministic unique filenames) with loud terminal output.
+
+- Groups by SeriesInstanceUID
+- Series folder name: <SeriesDescription>_<SeriesNumber>
+  (disambiguated with _<6-char-hash> if two different UIDs collide)
+- Output filename (guaranteed unique per instance):
+    <InstanceNumber:06d>_<short-SOPUID>.dcm
+  where short-SOPUID = first 12 hex chars of MD5(SOPInstanceUID)
+- If compressed and gdcmconv is available -> decompresses directly to final path
+- Else copy/move/link original directly
+- Prints progress + per-file actions to the terminal
+- Writes a manifest CSV documenting provenance + naming, including SubjectID/SessionID
+
+Usage:
+  dcm2dir --input-dir INPUT_DIR --output-dir DEST_DIR
+  dcm2dir --input-dir INPUT_DIR --output-dir DEST_DIR --subject-id sub-001 --session-id ses-01
+  dcm2dir --input-dir INPUT_DIR --output-dir DEST_DIR --force-decompress --mode copy|move|link \
+         --manifest /path/to/manifest.csv --skip-md5 --verbose
+
+Requires:
+  - pydicom
+  - (optional) gdcmconv on PATH for decompression
+"""
+
+import argparse
+import csv
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Optional, Tuple
+
+import pydicom
+from pydicom.errors import InvalidDicomError
+import pydicom.uid as _u  # version-safe access to UIDs
+
+# --- version-safe UID constants (older pydicom may not have JPEGBaseLineLossy8bit) ---
+JPEG_BASELINE = getattr(_u, "JPEGBaseLineLossy8bit", getattr(_u, "JPEGBaseline", None))
+JPEGLossless = getattr(_u, "JPEGLossless", _u.JPEGLossless)
+JPEGLosslessSV1 = getattr(_u, "JPEGLosslessSV1", _u.JPEGLossless)
+JPEG2000Lossless = getattr(_u, "JPEG2000Lossless", _u.JPEG2000Lossless)
+JPEG2000 = getattr(_u, "JPEG2000", _u.JPEG2000)
+RLELossless = getattr(_u, "RLELossless", _u.RLELossless)
+
+COMPRESSED_SYNTAXES = {
+    s
+    for s in map(
+        lambda x: str(x) if x is not None else None,
+        [JPEG_BASELINE, JPEGLossless, JPEGLosslessSV1, JPEG2000Lossless, JPEG2000, RLELossless],
+    )
+    if s is not None
+}
+
+# ---------- utils ----------
+
+
+def which(prog: str) -> Optional[str]:
+    from shutil import which as _which
+
+    return _which(prog)
+
+
+def safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def derive_subject_session(input_dir: Path) -> Tuple[str, str]:
+    """
+    Backward-compatible heuristic derivation of SubjectID and SessionID from input_dir.
+
+    NOTE: For reliable behavior, prefer using --subject-id/--session-id.
+    """
+    if input_dir.parent and input_dir.parent != input_dir:
+        return input_dir.parent.name, input_dir.name
+    return input_dir.name, ""
+
+
+def get_transfer_syntax_uid(ds: pydicom.Dataset) -> str:
+    fm = getattr(ds, "file_meta", None)
+    ts = getattr(fm, "TransferSyntaxUID", None)
+    return str(ts) if ts else ""
+
+
+def needs_decompression(ds: pydicom.Dataset) -> bool:
+    ts = get_transfer_syntax_uid(ds)
+    return ts in COMPRESSED_SYNTAXES if ts else False
+
+
+def hashlike(value: str, n: int = 6) -> str:
+    h = hashlib.md5(value.encode("utf-8")).hexdigest()
+    return h[:n]
+
+
+def sanitize_desc(text: str) -> str:
+    text = text or "UNKNOWN"
+    cleaned = "".join(ch if (ch.isalnum() or ch in "-_. ") else "_" for ch in str(text))
+    cleaned = "_".join(cleaned.strip().split())  # collapse whitespace to underscores
+    return cleaned[:128] or "UNKNOWN"
+
+
+def md5sum(path: Path, chunk: int = 1024 * 1024) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for c in iter(lambda: f.read(chunk), b""):
+            h.update(c)
+    return h.hexdigest()
+
+
+def run_gdcmconv(src: Path, dst: Path) -> Tuple[bool, str]:
+    """
+    Returns (ok, stderr_text).
+    """
+    try:
+        cmd = ["gdcmconv", "-w", str(src), str(dst)]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        ok = res.returncode == 0 and dst.exists()
+        stderr = (res.stderr or b"").decode(errors="replace")
+        return ok, stderr
+    except FileNotFoundError:
+        return False, "gdcmconv not found"
+
+
+def place_file(src: Path, dst: Path, mode: str) -> str:
+    """
+    Place src at dst according to mode. Returns actual action performed:
+      - "copy", "move", "link", or "link_fallback_copy"
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if mode == "copy":
+        shutil.copy2(src, dst)
+        return "copy"
+    if mode == "move":
+        shutil.move(src, dst)
+        return "move"
+    if mode == "link":
+        try:
+            rel = os.path.relpath(src, start=dst.parent)
+            os.symlink(rel, dst)
+            return "link"
+        except OSError:
+            shutil.copy2(src, dst)
+            return "link_fallback_copy"
+    raise ValueError(f"Unknown mode {mode}")
+
+
+def walk_files(root: Path):
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            yield Path(dirpath) / name
+
+
+def short_sop_uid(sop_uid: str, n: int = 12) -> str:
+    """
+    Short stable token derived from SOPInstanceUID.
+    Using md5(SOPInstanceUID) avoids filesystem issues with dots/length.
+    """
+    h = hashlib.md5(str(sop_uid).encode("utf-8")).hexdigest()
+    return h[:n]
+
+
+def build_unique_filename(ds: pydicom.Dataset) -> Tuple[str, str, int]:
+    """
+    Returns (filename, sop_uid_str, instance_number_int).
+
+    Filename format:
+      <InstanceNumber:06d>_<short-SOPUID>.dcm
+    """
+    sop = getattr(ds, "SOPInstanceUID", None)
+    sop_str = str(sop) if sop else ""
+
+    inst = safe_int(getattr(ds, "InstanceNumber", 0), 0)
+
+    # SOPInstanceUID should almost always exist for valid instances.
+    # If missing, fall back to a deterministic token derived from SeriesInstanceUID + instance number.
+    token = short_sop_uid(sop_str) if sop_str else hashlike(
+        str(getattr(ds, "SeriesInstanceUID", "")) + ":" + str(inst), n=12
+    )
+    filename = f"{inst:06d}_{token}.dcm"
+    return filename, sop_str, inst
+
+
+# ---------- scanning & planning ----------
+
+
+def scan_series(input_dir: Path, verbose: bool = False):
+    """
+    Group files by SeriesInstanceUID and capture SeriesDescription/Number.
+    Reads each file header once during scan.
+    """
+    series = defaultdict(lambda: {"files": [], "desc": "UNKNOWN", "num": 0})
+    total_seen = 0
+    total_dicom = 0
+
+    print(f"[SCAN] Walking: {input_dir}")
+    for p in walk_files(input_dir):
+        total_seen += 1
+        if not p.is_file():
+            continue
+
+        try:
+            ds = pydicom.dcmread(str(p), stop_before_pixels=True, force=True)
+        except (InvalidDicomError, Exception) as e:
+            if verbose:
+                print(f"  [skip] not DICOM/unreadable header ({type(e).__name__}): {p}")
+            continue
+
+        uid = getattr(ds, "SeriesInstanceUID", None)
+        if not uid:
+            if verbose:
+                print(f"  [skip] missing SeriesInstanceUID: {p}")
+            continue
+
+        total_dicom += 1
+
+        raw_desc = getattr(ds, "SeriesDescription", None)
+        raw_num = getattr(ds, "SeriesNumber", None)
+
+        desc = raw_desc if (raw_desc is not None and str(raw_desc).strip() != "") else "UNKNOWN"
+        num = safe_int(raw_num, 0)
+
+        s = series[str(uid)]
+        # Set first meaningful description/number we see
+        if s["desc"] == "UNKNOWN" and desc != "UNKNOWN":
+            s["desc"] = desc
+        if s["num"] == 0 and num != 0:
+            s["num"] = num
+
+        s["files"].append(p)
+
+    print(f"[SCAN] Files seen: {total_seen} | DICOMs: {total_dicom} | Series found: {len(series)}")
+    return series
+
+
+def plan_names(series_map, dest_dir: Path):
+    """
+    Series folder names: <SeriesDescription>_<SeriesNumber>
+    If two different UIDs would collide, add _<short-hash> to disambiguate.
+    """
+    counts = defaultdict(int)
+    for uid, meta in series_map.items():
+        base = f"{sanitize_desc(meta['desc'])}_{meta['num']}"
+        counts[base] += 1
+
+    plan = []
+    for uid, meta in series_map.items():
+        base = f"{sanitize_desc(meta['desc'])}_{meta['num']}"
+        name = base if counts[base] == 1 else f"{base}_{hashlike(uid, 6)}"
+        plan.append(
+            {
+                "uid": uid,
+                "series_name": name,
+                "desc": sanitize_desc(meta["desc"]),
+                "num": meta["num"],
+                "files": meta["files"],
+                "outdir": dest_dir / name,
+            }
+        )
+    return plan
+
+
+# ---------- main pipeline ----------
+
+
+def process(
+    input_dir: Path,
+    dest_dir: Path,
+    manifest_path: Path,
+    mode: str = "copy",
+    force_decompress: bool = False,
+    skip_md5: bool = False,
+    verbose: bool = False,
+    subject_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> int:
+    derived_subject, derived_session = derive_subject_session(input_dir)
+    subject_id = (subject_id if subject_id is not None else derived_subject) or "UNKNOWN"
+    session_id = (session_id if session_id is not None else derived_session) or ""
+
+    series_map = scan_series(input_dir, verbose=verbose)
+    if not series_map:
+        print("[ERROR] No DICOM series found.", file=sys.stderr)
+        return 1
+
+    plan = plan_names(series_map, dest_dir)
+    print("[PLAN] Destination root:", dest_dir)
+    print(f"[PLAN] SubjectID={subject_id}  SessionID={session_id or '(none)'}")
+    for it in plan:
+        print(f"  [series] {it['series_name']}  (UID={it['uid']})  n_files={len(it['files'])}")
+
+    has_gdcm = which("gdcmconv") is not None
+    if force_decompress and not has_gdcm:
+        print("[WARN] --force-decompress requested but gdcmconv not found on PATH; proceeding without decompression.")
+    elif has_gdcm:
+        print("[INFO] gdcmconv detected; compressed files will be decompressed on-the-fly.")
+
+    placed = 0
+    exists = 0
+    errors = 0
+    rows = []
+    total_files = sum(len(it["files"]) for it in plan)
+    processed = 0
+
+    for item in plan:
+        outdir = item["outdir"]
+        outdir.mkdir(parents=True, exist_ok=True)
+        print(f"[WRITE] Series → {outdir}")
+
+        for src in item["files"]:
+            processed += 1
+
+            sop_uid = ""
+            inst_num = ""
+            ts_uid = ""
+
+            try:
+                ds = pydicom.dcmread(str(src), stop_before_pixels=True, force=True)
+
+                dst_name, sop_uid, inst_int = build_unique_filename(ds)
+                inst_num = str(inst_int)
+                ts_uid = get_transfer_syntax_uid(ds)
+
+                dst = outdir / dst_name
+
+                # Exists check (idempotent reruns / avoid duplicates)
+                if dst.exists():
+                    exists += 1
+                    print(f"[{processed}/{total_files}] exists: {dst}")
+                    rows.append(
+                        {
+                            "SubjectID": subject_id,
+                            "SessionID": session_id,
+                            "SeriesInstanceUID": item["uid"],
+                            "SeriesDescription": item["desc"],
+                            "SeriesNumber": item["num"],
+                            "OutputDir": str(outdir),
+                            "SOPInstanceUID": sop_uid,
+                            "InstanceNumber": inst_num,
+                            "TransferSyntaxUID": ts_uid,
+                            "src_path": str(src),
+                            "src_basename": src.name,
+                            "dst_path": str(dst),
+                            "dst_basename": dst.name,
+                            "md5": "" if skip_md5 else md5sum(dst),
+                            "action": "exists",
+                            "note": "",
+                        }
+                    )
+                    continue
+
+                do_decompress = (force_decompress or needs_decompression(ds)) and has_gdcm
+
+                if do_decompress:
+                    ok, stderr = run_gdcmconv(src, dst)
+                    if ok:
+                        placed += 1
+                        print(f"[{processed}/{total_files}] decompress → {dst}")
+                        action = "decompressed"
+                        note = ""
+                    else:
+                        # Fallback to copy if decompression failed
+                        place_file(src, dst, mode="copy")
+                        placed += 1
+                        print(f"[{processed}/{total_files}] decompress FAILED → copied: {dst}")
+                        action = "decompress_failed_fallback_copy"
+                        note = (stderr[:500] + ("…" if len(stderr) > 500 else "")) if verbose else ""
+                else:
+                    actual = place_file(src, dst, mode=mode)
+                    placed += 1
+                    print(f"[{processed}/{total_files}] {actual} → {dst}")
+                    action = actual
+                    note = ""
+
+                rows.append(
+                    {
+                        "SubjectID": subject_id,
+                        "SessionID": session_id,
+                        "SeriesInstanceUID": item["uid"],
+                        "SeriesDescription": item["desc"],
+                        "SeriesNumber": item["num"],
+                        "OutputDir": str(outdir),
+                        "SOPInstanceUID": sop_uid,
+                        "InstanceNumber": inst_num,
+                        "TransferSyntaxUID": ts_uid,
+                        "src_path": str(src),
+                        "src_basename": src.name,
+                        "dst_path": str(dst),
+                        "dst_basename": dst.name,
+                        "md5": "" if skip_md5 else md5sum(dst),
+                        "action": action,
+                        "note": note,
+                    }
+                )
+
+            except Exception as e:
+                errors += 1
+                print(f"[{processed}/{total_files}] ERROR {type(e).__name__}: {src}", file=sys.stderr)
+                rows.append(
+                    {
+                        "SubjectID": subject_id,
+                        "SessionID": session_id,
+                        "SeriesInstanceUID": item["uid"],
+                        "SeriesDescription": item["desc"],
+                        "SeriesNumber": item["num"],
+                        "OutputDir": str(outdir),
+                        "SOPInstanceUID": sop_uid,
+                        "InstanceNumber": inst_num,
+                        "TransferSyntaxUID": ts_uid,
+                        "src_path": str(src),
+                        "src_basename": src.name,
+                        "dst_path": "",
+                        "dst_basename": "",
+                        "md5": "",
+                        "action": "error",
+                        "note": f"{type(e).__name__}: {str(e)[:500]}",
+                    }
+                )
+
+    # Manifest
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(manifest_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "SubjectID",
+                "SessionID",
+                "SeriesInstanceUID",
+                "SeriesDescription",
+                "SeriesNumber",
+                "OutputDir",
+                "SOPInstanceUID",
+                "InstanceNumber",
+                "TransferSyntaxUID",
+                "src_path",
+                "src_basename",
+                "dst_path",
+                "dst_basename",
+                "md5",
+                "action",
+                "note",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[SUMMARY] Placed: {placed} | Exists: {exists} | Errors: {errors} | Manifest: {manifest_path}")
+    return 0 if placed > 0 or exists > 0 else 1
+
+
+# ---------- CLI ----------
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description=(
+            "Copy/Move/Link DICOMs into <SeriesDescription>_<SeriesNumber> folders, "
+            "with on-the-fly decompression and deterministic unique filenames: "
+            "<InstanceNumber:06d>_<short-SOPUID>.dcm"
+        )
+    )
+    p.add_argument(
+        "--input-dir",
+        "-i",
+        required=True,
+        type=Path,
+        help="Root directory to scan for DICOMs",
+        dest="input_dir",
+    )
+    p.add_argument(
+        "--output-dir",
+        "-o",
+        required=True,
+        type=Path,
+        help="Destination directory (subject/session/series folders created here)",
+        dest="output_dir",
+    )
+    p.add_argument(
+        "--subject-id",
+        type=str,
+        default=None,
+        help="SubjectID to record in manifest and to create as a subdirectory under OUTPUT_DIR",
+        dest="subject_id",
+    )
+    p.add_argument(
+        "--session-id",
+        type=str,
+        default=None,
+        help="SessionID to record in manifest and to create as a subdirectory under OUTPUT_DIR/SubjectID (optional)",
+        dest="session_id",
+    )
+    p.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Manifest CSV path (default: OUTPUT_DIR/SubjectID[/SessionID]/_staging_manifest.csv)",
+    )
+    p.add_argument(
+        "--mode",
+        choices=["copy", "move", "link"],
+        default="copy",
+        help="How to place uncompressed files (default: copy)",
+    )
+    p.add_argument(
+        "--force-decompress",
+        action="store_true",
+        help="Force try to decompress all DICOMs (requires gdcmconv)",
+    )
+    p.add_argument("--skip-md5", action="store_true", help="Skip MD5 hashing for speed")
+    p.add_argument("--verbose", action="store_true", help="Print extra info (skips, gdcmconv stderr on failure)")
+    return p
+
+
+def main(argv=None) -> int:
+    ap = build_parser()
+    args = ap.parse_args(argv)
+
+    input_dir = args.input_dir.resolve()
+    dest_base = args.output_dir.resolve()
+    if not input_dir.is_dir():
+        ap.error(f"{input_dir} is not a directory")
+
+    # Determine subject/session to use (CLI overrides > derived)
+    derived_subject, derived_session = derive_subject_session(input_dir)
+    subject_id = (args.subject_id if args.subject_id is not None else derived_subject) or "UNKNOWN"
+    session_id = (args.session_id if args.session_id is not None else derived_session) or ""
+
+    # Destination root becomes OUTPUT_DIR/SubjectID[/SessionID]
+    if session_id:
+        dest_dir = dest_base / subject_id / session_id
+    else:
+        dest_dir = dest_base / subject_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Default manifest lives inside the subject/session destination root
+    manifest = args.manifest or (dest_dir / "_staging_manifest.csv")
+
+    return process(
+        input_dir=input_dir,
+        dest_dir=dest_dir,
+        manifest_path=manifest,
+        mode=args.mode,
+        force_decompress=args.force_decompress,
+        skip_md5=args.skip_md5,
+        verbose=args.verbose,
+        subject_id=subject_id,
+        session_id=session_id,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

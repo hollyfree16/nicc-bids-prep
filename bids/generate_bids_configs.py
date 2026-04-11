@@ -243,7 +243,8 @@ def resolve_series(series_list, template):
     records = []
     for i, desc in enumerate(series_list):
         cf = desc.casefold()
-        if always_ignore(desc):
+        # Always-ignore is overridden if the sequence is explicitly mapped in the template
+        if always_ignore(desc) and cf not in mapping_cf:
             records.append(_rec(desc, "ignore", "IGNORE", "IGNORE", False, "always-ignore list"))
             continue
         if i in superseded_implicit:

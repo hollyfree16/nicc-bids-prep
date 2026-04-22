@@ -70,6 +70,7 @@ from collections import defaultdict
 
 ALWAYS_IGNORE_RE = re.compile(r"""(
     ^AAHScout | ^AAHScout_MPR |
+    ^AAScout | ^AAScout_MPR |
     ^Localizer$ | ^Localizer_aligned$ | ^localizer$ |
     ^Loc$ | ^Loc_MPR |
     ^Survey | ^survey |

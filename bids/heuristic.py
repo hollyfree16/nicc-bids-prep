@@ -11,10 +11,13 @@ _mapping_env = os.environ.get("HEUDICONV_MAPPING_TSV")
 MAPPING_TSV = Path(_mapping_env) if _mapping_env else HERE / "mapping.tsv"
 
 
-POPULATE_INTENDED_FOR_OPTS = {
-    "matching_parameters": ["ImagingVolume"],
-    "criterion": "Closest",
-}
+if os.environ.get("HEUDICONV_DISABLE_INTENDED_FOR"):
+    POPULATE_INTENDED_FOR_OPTS = {}
+else:
+    POPULATE_INTENDED_FOR_OPTS = {
+        "matching_parameters": ["ImagingVolume"],
+        "criterion": "Closest",
+    }
 
 _ALLOWED = {
     "ImagingVolume",
@@ -25,11 +28,12 @@ _ALLOWED = {
     "Force",
 }
 
-bad = [p for p in POPULATE_INTENDED_FOR_OPTS["matching_parameters"] if p not in _ALLOWED]
-if bad:
-    raise RuntimeError(
-        f"Invalid matching_parameters: {bad}. Allowed: {sorted(_ALLOWED)}"
-    )
+if POPULATE_INTENDED_FOR_OPTS:
+    bad = [p for p in POPULATE_INTENDED_FOR_OPTS.get("matching_parameters", []) if p not in _ALLOWED]
+    if bad:
+        raise RuntimeError(
+            f"Invalid matching_parameters: {bad}. Allowed: {sorted(_ALLOWED)}"
+        )
 
 
 def create_key(template, outtype=("nii.gz",), annotation_classes=None):

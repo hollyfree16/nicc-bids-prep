@@ -42,7 +42,7 @@ Usage
 Outputs per subject  (<output_dir>/sub-<subject>_ses-<session>/)
 ----------------------------------------------------------------
     <tag>_mapping.tsv          heudiconv mapping input
-    <tag>_BIDS.sh              ready-to-run heudiconv command
+    <tag>_BIDS.sh              ready-to-run heudiconv command (with IntendedFor retry)
     <tag>_series_resolved.tsv  every series + its resolved status  [troubleshooting]
     <tag>_protocol_match.txt   template match details               [troubleshooting]
 
@@ -325,9 +325,7 @@ def generate_mapping_tsv(subject, session, records):
 def generate_bids_sh(subject, session, mapping_abs,
                      dicom_template, bids_output, heuristic_path):
     ses_line = f" \\\n -ss {session}" if session else ""
-    return (
-        "#!/bin/bash\n\n"
-        f"export HEUDICONV_MAPPING_TSV={mapping_abs}\n\n"
+    heudiconv_cmd = (
         "heudiconv \\\n"
         f" --dicom_dir_template {dicom_template} \\\n"
         f" -o {bids_output} \\\n"
@@ -336,7 +334,18 @@ def generate_bids_sh(subject, session, mapping_abs,
         " -b \\\n"
         " --minmeta \\\n"
         " --overwrite \\\n"
-        f" -s {subject}{ses_line}\n"
+        f" -s {subject}{ses_line}"
+    )
+    return (
+        "#!/bin/bash\n\n"
+        f"export HEUDICONV_MAPPING_TSV={mapping_abs}\n\n"
+        "# Run heudiconv with IntendedFor auto-population enabled\n"
+        f"{heudiconv_cmd}\n\n"
+        "if [ $? -ne 0 ]; then\n"
+        f'    echo "[RETRY] sub-{subject} failed — retrying with IntendedFor disabled"\n'
+        "    export HEUDICONV_DISABLE_INTENDED_FOR=1\n"
+        f"    {heudiconv_cmd}\n"
+        "fi\n"
     )
 
 
@@ -554,7 +563,7 @@ Incomplete sessions: {n_inc}
 
 Per-subject files (in each sub-*/ses-* folder)
   <tag>_mapping.tsv          heudiconv mapping input
-  <tag>_BIDS.sh              ready-to-run heudiconv command
+  <tag>_BIDS.sh              ready-to-run heudiconv command (with IntendedFor retry)
   <tag>_series_resolved.tsv  every series + resolved status  [troubleshooting]
   <tag>_protocol_match.txt   template detection details       [troubleshooting]
 

@@ -12,13 +12,13 @@ MAPPING_TSV = Path(_mapping_env) if _mapping_env else HERE / "mapping.tsv"
 
 
 if os.environ.get("HEUDICONV_DISABLE_INTENDED_FOR"):
-    POPULATE_INTENDED_FOR_OPTS = {}
+    POPULATE_INTENDED_FOR_OPTS = None
 else:
     POPULATE_INTENDED_FOR_OPTS = {
         "matching_parameters": ["ImagingVolume"],
         "criterion": "Closest",
     }
-
+    
 _ALLOWED = {
     "ImagingVolume",
     "ModalityAcquisitionLabel",

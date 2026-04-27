@@ -13,40 +13,15 @@ Designed for DICOM directories staged by dicom/dcm2dir:
                 <SeriesDescription>_<SeriesNumber>/
                     *.dcm
 
-or:
+Default mode:
+  - one row per series folder
+  - count files per series folder
+  - read one representative DICOM header per series
+  - ordered by SeriesNumber / AcquisitionTime / SeriesTime
+  - skip existing TSV unless --force
 
-    RAW_ROOT/
-        SubjectID/
-            <SeriesDescription>_<SeriesNumber>/
-                *.dcm
-
-Default mode is fast:
-  - treats each discovered DICOM-containing folder as one series
-  - counts files in that folder
-  - reads one representative DICOM header per series
-  - preserves scan order using SeriesNumber/AcquisitionTime/SeriesTime
-  - prints progress subject-by-subject during batch mode
-
-Optional deep QC:
-  - --check-instances reads every DICOM in each series to detect missing instance numbers
-  - this is slower and should only be used when needed
-
-Examples
---------
-Single subject/session:
-    python query_series.py --input-dir /raw/mri/sub-001/ses-001 --output-dir /logs
-
-Batch all sessions:
-    python query_series.py --input-dir /raw/mri --output-dir /logs --batch
-
-Batch only ses-001:
-    python query_series.py --input-dir /raw/mri --output-dir /logs --batch --session-filter ses-001
-
-Regenerate existing TSVs:
-    python query_series.py --input-dir /raw/mri --output-dir /logs --batch --force
-
-Run slower instance-number QC:
-    python query_series.py --input-dir /raw/mri --output-dir /logs --batch --check-instances
+Optional:
+  - --check-instances reads every DICOM in each series to check InstanceNumber gaps
 """
 
 from __future__ import annotations
@@ -64,27 +39,6 @@ import pydicom
 
 
 DICOM_EXTENSIONS = {".dcm", ".ima", ""}
-
-HEADER_TAGS = [
-    "StudyDate",
-    "SeriesDate",
-    "AcquisitionDate",
-    "SeriesTime",
-    "AcquisitionTime",
-    "SeriesNumber",
-    "SeriesInstanceUID",
-    "SeriesDescription",
-    "ProtocolName",
-    "SequenceName",
-    "ImageType",
-    "EchoTime",
-    "EchoNumber",
-    "RepetitionTime",
-    "PhaseEncodingDirection",
-    "InPlanePhaseEncodingDirection",
-    "InstanceNumber",
-]
-
 
 FIELDNAMES = [
     "subject",
@@ -133,9 +87,8 @@ def is_probable_dicom_file(path: Path) -> bool:
 
 
 def iter_dicom_candidates(series_dir: Path) -> Iterable[Path]:
-    """Yield candidate DICOM files directly inside a series folder."""
     try:
-        for p in series_dir.iterdir():
+        for p in sorted(series_dir.iterdir()):
             if is_probable_dicom_file(p):
                 yield p
     except Exception:
@@ -143,25 +96,27 @@ def iter_dicom_candidates(series_dir: Path) -> Iterable[Path]:
 
 
 def read_dicom_header(path: Path):
-    try:
-        return pydicom.dcmread(
-            str(path),
-            stop_before_pixels=True,
-            force=True,
-            specific_tags=HEADER_TAGS,
-        )
-    except TypeError:
-        # Older pydicom compatibility.
-        return pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
+    # Match the user's successful manual test. Avoid specific_tags because it can
+    # behave differently across pydicom versions / unusual files.
+    return pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
 
 
-def first_readable_dicom(series_dir: Path) -> Optional[Path]:
+def first_readable_dicom(series_dir: Path, verbose: bool = False) -> Optional[Path]:
+    n_candidates = 0
+    first_error = None
+
     for p in iter_dicom_candidates(series_dir):
+        n_candidates += 1
         try:
             read_dicom_header(p)
             return p
-        except Exception:
+        except Exception as e:
+            if first_error is None:
+                first_error = f"{type(e).__name__}: {str(e)[:300]}"
             continue
+
+    if verbose and n_candidates:
+        warn(f"[WARN] {series_dir}: {n_candidates} candidate file(s), none readable. First error: {first_error}")
     return None
 
 
@@ -240,7 +195,6 @@ def infer_subject_session(input_dir: Path, raw_root: Optional[Path] = None) -> T
             pass
 
     if not subject:
-        # Single-subject mode fallback.
         if input_dir.parent != input_dir:
             subject = input_dir.parent.name
             session = input_dir.name
@@ -251,12 +205,6 @@ def infer_subject_session(input_dir: Path, raw_root: Optional[Path] = None) -> T
 
 
 def candidate_session_dirs_by_glob(raw_root: Path, session_filters: Optional[List[str]]) -> List[Path]:
-    """
-    Lightweight discovery only. Does not inspect DICOM headers.
-
-    This returns likely subject/session dirs such as:
-        raw_root/sub-001/ses-001
-    """
     found = []
 
     if session_filters:
@@ -277,7 +225,6 @@ def candidate_session_dirs_by_glob(raw_root: Path, session_filters: Optional[Lis
         log(f"[DISCOVER] pattern={raw_root / '*/ses-*'}  matches={len(matches)}")
         found.extend(matches)
 
-        # Also include possible no-session subject dirs. We do not validate here.
         try:
             subject_dirs = [p for p in raw_root.iterdir() if p.is_dir() and p not in found]
             log(f"[DISCOVER] possible no-session subject dirs={len(subject_dirs)}")
@@ -295,32 +242,48 @@ def output_path_for(output_dir: Path, subject: str, session: str) -> Path:
     return output_dir / f"{tag}_series.tsv"
 
 
-def list_series_dirs(input_dir: Path) -> List[Path]:
-    """
-    Return DICOM-containing series folders under a subject/session directory.
-
-    First checks direct children, as produced by dcm2dir.
-    If none are found, falls back to a recursive search under this one subject/session.
-    """
+def list_series_dirs(input_dir: Path, verbose: bool = False) -> List[Path]:
     direct = []
+    children = []
     try:
-        children = [child for child in input_dir.iterdir() if child.is_dir()]
-    except Exception:
-        children = []
+        children = [child for child in sorted(input_dir.iterdir()) if child.is_dir()]
+    except Exception as e:
+        warn(f"[WARN] Could not list {input_dir}: {type(e).__name__}: {e}")
+        return []
+
+    if verbose:
+        log(f"[DEBUG] {input_dir}: {len(children)} child directories")
 
     for child in children:
-        if first_readable_dicom(child) is not None:
+        # Do not require successful read twice unless needed for validation.
+        n_files = sum(1 for _ in iter_dicom_candidates(child))
+        if n_files == 0:
+            if verbose:
+                log(f"[DEBUG] {child.name}: no candidate DICOM files")
+            continue
+
+        example = first_readable_dicom(child, verbose=verbose)
+        if example is not None:
             direct.append(child)
+        elif verbose:
+            warn(f"[WARN] {child.name}: {n_files} candidate DICOM files but no readable header")
 
     if direct:
         return sorted(direct)
 
+    # Fallback: some layouts have one extra nesting level.
     recursive = []
     for dirpath, dirnames, _ in os.walk(input_dir):
         path = Path(dirpath)
         if path == input_dir:
             continue
-        if first_readable_dicom(path) is not None:
+
+        n_files = sum(1 for _ in iter_dicom_candidates(path))
+        if n_files == 0:
+            continue
+
+        example = first_readable_dicom(path, verbose=verbose)
+        if example is not None:
             recursive.append(path)
             dirnames[:] = []
 
@@ -332,10 +295,6 @@ def count_candidate_files(series_dir: Path) -> int:
 
 
 def inspect_instances(series_dir: Path) -> Tuple[str, str, str, str]:
-    """
-    Slow optional QC. Reads every DICOM in the series folder.
-    Returns min, max, n_unique, partial_flag.
-    """
     instance_numbers = []
     n_files = 0
 
@@ -430,6 +389,7 @@ def write_subject_tsv(
     raw_root: Optional[Path] = None,
     force: bool = False,
     check_instances: bool = False,
+    verbose: bool = False,
 ) -> Tuple[str, Optional[Path], int]:
     inferred_subject, inferred_session = infer_subject_session(input_dir, raw_root=raw_root)
     subject = subject or inferred_subject
@@ -442,11 +402,13 @@ def write_subject_tsv(
         log(f"[SKIP] {subject} {session or ''}: existing TSV found: {out_tsv}")
         return "skipped", None, 0
 
-    series_dirs = list_series_dirs(input_dir)
+    series_dirs = list_series_dirs(input_dir, verbose=verbose)
     log(f"[SERIES] {subject} {session or ''}: found {len(series_dirs)} series folders")
 
     if not series_dirs:
         warn(f"[WARN] {subject} {session or ''}: no readable DICOM series folders found under {input_dir}")
+        if verbose:
+            warn("[WARN] Try checking the first child directory manually with pydicom.dcmread(..., stop_before_pixels=True, force=True)")
         return "no_series", None, 0
 
     rows = []
@@ -486,19 +448,18 @@ def build_parser():
         "--session-filter",
         action="append",
         default=None,
-        help=(
-            "Batch mode only: process only matching session labels, e.g. ses-001. "
-            "Can be supplied more than once. Matching is case-insensitive and accepts 001 or ses-001."
-        ),
+        help="Batch mode only: process matching session labels, e.g. ses-001. Can be repeated.",
     )
     p.add_argument("--force", action="store_true")
     p.add_argument(
         "--check-instances",
         action="store_true",
-        help=(
-            "Slower QC mode: read every DICOM in each series to compute min/max/unique "
-            "InstanceNumber and flag missing instance-number gaps."
-        ),
+        help="Slower QC mode: read every DICOM in each series to check InstanceNumber gaps.",
+    )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print debug details for folder discovery and unreadable files.",
     )
     return p
 
@@ -517,7 +478,7 @@ def main(argv=None) -> int:
         log(f"[INFO] Batch input root: {input_dir}")
         log(f"[INFO] Output dir: {output_dir}")
         if args.check_instances:
-            log("[INFO] --check-instances enabled: this will read every DICOM in each series and may be slow")
+            log("[INFO] --check-instances enabled: this reads every DICOM in each series and may be slow")
 
         subject_dirs = candidate_session_dirs_by_glob(input_dir, args.session_filter)
 
@@ -551,6 +512,7 @@ def main(argv=None) -> int:
                     raw_root=input_dir,
                     force=args.force,
                     check_instances=args.check_instances,
+                    verbose=args.verbose,
                 )
             except Exception as e:
                 n_errors += 1
@@ -579,6 +541,7 @@ def main(argv=None) -> int:
         raw_root=None,
         force=args.force,
         check_instances=args.check_instances,
+        verbose=args.verbose,
     )
     log(f"[SUMMARY] status={status}")
     return 0 if status in {"written", "skipped"} else 1

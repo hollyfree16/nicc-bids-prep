@@ -25,6 +25,7 @@ Default mode is fast:
   - counts files in that folder
   - reads one representative DICOM header per series
   - preserves scan order using SeriesNumber/AcquisitionTime/SeriesTime
+  - prints progress subject-by-subject during batch mode
 
 Optional deep QC:
   - --check-instances reads every DICOM in each series to detect missing instance numbers
@@ -113,6 +114,14 @@ FIELDNAMES = [
     "series_dir",
     "example_dicom",
 ]
+
+
+def log(message: str):
+    print(message, flush=True)
+
+
+def warn(message: str):
+    print(message, file=sys.stderr, flush=True)
 
 
 def is_probable_dicom_file(path: Path) -> bool:
@@ -241,80 +250,42 @@ def infer_subject_session(input_dir: Path, raw_root: Optional[Path] = None) -> T
     return subject, session
 
 
-def discover_session_dirs_by_glob(raw_root: Path, session_filters: Optional[List[str]]) -> List[Path]:
+def candidate_session_dirs_by_glob(raw_root: Path, session_filters: Optional[List[str]]) -> List[Path]:
     """
-    Trust the expected raw layout first.
+    Lightweight discovery only. Does not inspect DICOM headers.
 
-    This directly supports:
-        raw_root/sub-*/ses-001
-        raw_root/<subject>/ses-001
+    This returns likely subject/session dirs such as:
+        raw_root/sub-001/ses-001
     """
     found = []
 
     if session_filters:
-        # Use explicit session globs first; this avoids walking the entire tree.
         for s in session_filters:
             s_norm = normalize_session_label(s)
-            session_name = s_norm  # normalize_session_label returns ses-*
-            found.extend(p for p in raw_root.glob(f"*/{session_name}") if p.is_dir())
-
-            # Also try the exact user-provided label in case it is non-standard.
             s_raw = str(s).strip()
-            if s_raw and s_raw != session_name:
-                found.extend(p for p in raw_root.glob(f"*/{s_raw}") if p.is_dir())
+
+            patterns = [f"*/{s_norm}"]
+            if s_raw and s_raw != s_norm:
+                patterns.append(f"*/{s_raw}")
+
+            for pattern in patterns:
+                matches = [p for p in raw_root.glob(pattern) if p.is_dir()]
+                log(f"[DISCOVER] pattern={raw_root / pattern}  matches={len(matches)}")
+                found.extend(matches)
     else:
-        # Common session layout.
-        found.extend(p for p in raw_root.glob("*/ses-*") if p.is_dir())
+        matches = [p for p in raw_root.glob("*/ses-*") if p.is_dir()]
+        log(f"[DISCOVER] pattern={raw_root / '*/ses-*'}  matches={len(matches)}")
+        found.extend(matches)
 
-        # No-session layout: raw_root/subject/series/*.dcm
-        for p in raw_root.iterdir() if raw_root.exists() else []:
-            if p.is_dir() and list_series_dirs(p):
-                found.append(p)
-
-    return sorted(set(found))
-
-
-def subject_session_dirs_fallback_walk(raw_root: Path, session_filters: Optional[List[str]]) -> List[Path]:
-    """
-    Slower fallback for unusual nesting. Finds directories that contain DICOM series folders.
-    """
-    wanted = None
-    if session_filters:
-        wanted = {normalize_session_label(s) for s in session_filters}
-
-    found = []
-    for dirpath, dirnames, _ in os.walk(raw_root):
-        path = Path(dirpath)
-        subject, session = infer_subject_session(path, raw_root=raw_root)
-
-        if wanted is not None and normalize_session_label(session) not in wanted:
-            # If this directory itself looks like a nonmatching session, prune it.
-            if path.name.lower().startswith("ses-"):
-                dirnames[:] = []
-            continue
-
-        if list_series_dirs(path):
-            found.append(path)
-            dirnames[:] = []
+        # Also include possible no-session subject dirs. We do not validate here.
+        try:
+            subject_dirs = [p for p in raw_root.iterdir() if p.is_dir() and p not in found]
+            log(f"[DISCOVER] possible no-session subject dirs={len(subject_dirs)}")
+            found.extend(subject_dirs)
+        except Exception:
+            pass
 
     return sorted(set(found))
-
-
-def subject_session_dirs(raw_root: Path, session_filters: Optional[List[str]] = None) -> List[Path]:
-    """
-    Find subject/session directories.
-
-    The fast path uses direct globbing such as raw_root/*/ses-001.
-    The fallback walks only if direct globbing finds nothing usable.
-    """
-    candidates = discover_session_dirs_by_glob(raw_root, session_filters)
-
-    usable = [p for p in candidates if list_series_dirs(p)]
-    if usable:
-        return sorted(set(usable))
-
-    # If globbed sessions exist but list_series_dirs failed, still try fallback.
-    return subject_session_dirs_fallback_walk(raw_root, session_filters)
 
 
 def output_path_for(output_dir: Path, subject: str, session: str) -> Path:
@@ -329,16 +300,17 @@ def list_series_dirs(input_dir: Path) -> List[Path]:
     Return DICOM-containing series folders under a subject/session directory.
 
     First checks direct children, as produced by dcm2dir.
-    If none are found, falls back to a recursive search for DICOM-containing folders.
-    This handles an extra nesting level without requiring a full raw-root scan.
+    If none are found, falls back to a recursive search under this one subject/session.
     """
     direct = []
     try:
-        for child in input_dir.iterdir():
-            if child.is_dir() and first_readable_dicom(child) is not None:
-                direct.append(child)
+        children = [child for child in input_dir.iterdir() if child.is_dir()]
     except Exception:
-        pass
+        children = []
+
+    for child in children:
+        if first_readable_dicom(child) is not None:
+            direct.append(child)
 
     if direct:
         return sorted(direct)
@@ -458,7 +430,7 @@ def write_subject_tsv(
     raw_root: Optional[Path] = None,
     force: bool = False,
     check_instances: bool = False,
-) -> Optional[Path]:
+) -> Tuple[str, Optional[Path], int]:
     inferred_subject, inferred_session = infer_subject_session(input_dir, raw_root=raw_root)
     subject = subject or inferred_subject
     session = session if session is not None else inferred_session
@@ -467,12 +439,20 @@ def write_subject_tsv(
     out_tsv = output_path_for(output_dir, subject, session)
 
     if out_tsv.exists() and not force:
-        print(f"[SKIP] {subject} {session or ''}: existing TSV found: {out_tsv}")
-        return None
+        log(f"[SKIP] {subject} {session or ''}: existing TSV found: {out_tsv}")
+        return "skipped", None, 0
 
     series_dirs = list_series_dirs(input_dir)
+    log(f"[SERIES] {subject} {session or ''}: found {len(series_dirs)} series folders")
+
+    if not series_dirs:
+        warn(f"[WARN] {subject} {session or ''}: no readable DICOM series folders found under {input_dir}")
+        return "no_series", None, 0
+
     rows = []
-    for series_dir in series_dirs:
+    for i, series_dir in enumerate(series_dirs, start=1):
+        if i == 1 or i == len(series_dirs) or i % 10 == 0:
+            log(f"[READ] {subject} {session or ''}: series {i}/{len(series_dirs)}")
         row = summarize_series_dir(series_dir, subject, session, check_instances=check_instances)
         if row is not None:
             rows.append(row)
@@ -489,8 +469,8 @@ def write_subject_tsv(
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"[WRITE] {subject} {session or ''}: {len(rows)} series -> {out_tsv}")
-    return out_tsv
+    log(f"[WRITE] {subject} {session or ''}: {len(rows)} series -> {out_tsv}")
+    return "written", out_tsv, len(rows)
 
 
 def build_parser():
@@ -530,46 +510,68 @@ def main(argv=None) -> int:
     output_dir = args.output_dir.resolve()
 
     if not input_dir.is_dir():
-        print(f"ERROR: input dir does not exist: {input_dir}", file=sys.stderr)
+        warn(f"ERROR: input dir does not exist: {input_dir}")
         return 2
 
     if args.batch:
-        subject_dirs = subject_session_dirs(input_dir, session_filters=args.session_filter)
+        log(f"[INFO] Batch input root: {input_dir}")
+        log(f"[INFO] Output dir: {output_dir}")
+        if args.check_instances:
+            log("[INFO] --check-instances enabled: this will read every DICOM in each series and may be slow")
+
+        subject_dirs = candidate_session_dirs_by_glob(input_dir, args.session_filter)
+
         if not subject_dirs:
-            print(f"ERROR: no subject/session DICOM directories found under {input_dir}", file=sys.stderr)
+            warn(f"ERROR: no candidate subject/session directories found under {input_dir}")
             if args.session_filter:
                 wanted = ", ".join(args.session_filter)
-                print(
-                    f"Hint: expected paths like {input_dir}/sub-*/{wanted}/<series>/*.dcm",
-                    file=sys.stderr,
-                )
+                warn(f"Hint: expected paths like {input_dir}/sub-*/{wanted}/<series>/*.dcm")
             return 1
 
         if args.session_filter:
             wanted = sorted({normalize_session_label(s) for s in args.session_filter})
-            print(f"[INFO] Session filter {wanted}: {len(subject_dirs)} subject/session directories selected")
+            log(f"[INFO] Session filter {wanted}: {len(subject_dirs)} candidate subject/session directories")
         else:
-            print(f"[INFO] Found {len(subject_dirs)} subject/session directories under {input_dir}")
+            log(f"[INFO] Found {len(subject_dirs)} candidate subject/session directories")
 
         n_written = 0
         n_skipped = 0
-        for subject_dir in subject_dirs:
-            result = write_subject_tsv(
-                input_dir=subject_dir,
-                output_dir=output_dir,
-                raw_root=input_dir,
-                force=args.force,
-                check_instances=args.check_instances,
-            )
-            if result is None:
-                n_skipped += 1
-            else:
+        n_no_series = 0
+        n_errors = 0
+
+        total = len(subject_dirs)
+        for idx, subject_dir in enumerate(subject_dirs, start=1):
+            subject, session = infer_subject_session(subject_dir, raw_root=input_dir)
+            log(f"[START] {idx}/{total} {subject} {session or ''}  path={subject_dir}")
+
+            try:
+                status, _, _ = write_subject_tsv(
+                    input_dir=subject_dir,
+                    output_dir=output_dir,
+                    raw_root=input_dir,
+                    force=args.force,
+                    check_instances=args.check_instances,
+                )
+            except Exception as e:
+                n_errors += 1
+                warn(f"[ERROR] {subject} {session or ''}: {type(e).__name__}: {e}")
+                continue
+
+            if status == "written":
                 n_written += 1
+            elif status == "skipped":
+                n_skipped += 1
+            elif status == "no_series":
+                n_no_series += 1
 
-        print(f"[SUMMARY] written={n_written} skipped_existing={n_skipped}")
-        return 0
+        log(
+            f"[SUMMARY] candidates={total} written={n_written} "
+            f"skipped_existing={n_skipped} no_series={n_no_series} errors={n_errors}"
+        )
+        return 0 if n_written or n_skipped else 1
 
-    result = write_subject_tsv(
+    log(f"[INFO] Single input dir: {input_dir}")
+    status, _, _ = write_subject_tsv(
         input_dir=input_dir,
         output_dir=output_dir,
         subject=args.subject,
@@ -578,8 +580,8 @@ def main(argv=None) -> int:
         force=args.force,
         check_instances=args.check_instances,
     )
-    print(f"[SUMMARY] written={1 if result else 0} skipped_existing={1 if result is None else 0}")
-    return 0
+    log(f"[SUMMARY] status={status}")
+    return 0 if status in {"written", "skipped"} else 1
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ or:
                 *.dcm
 
 Default mode is fast:
-  - treats each dcm2dir series folder as one series
+  - treats each discovered DICOM-containing folder as one series
   - counts files in that folder
   - reads one representative DICOM header per series
   - preserves scan order using SeriesNumber/AcquisitionTime/SeriesTime
@@ -124,23 +124,13 @@ def is_probable_dicom_file(path: Path) -> bool:
 
 
 def iter_dicom_candidates(series_dir: Path) -> Iterable[Path]:
-    """dcm2dir writes DICOMs directly inside each series folder."""
+    """Yield candidate DICOM files directly inside a series folder."""
     try:
         for p in series_dir.iterdir():
             if is_probable_dicom_file(p):
                 yield p
     except Exception:
         return
-
-
-def first_readable_dicom(series_dir: Path) -> Optional[Path]:
-    for p in iter_dicom_candidates(series_dir):
-        try:
-            read_dicom_header(p)
-            return p
-        except Exception:
-            continue
-    return None
 
 
 def read_dicom_header(path: Path):
@@ -154,6 +144,16 @@ def read_dicom_header(path: Path):
     except TypeError:
         # Older pydicom compatibility.
         return pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
+
+
+def first_readable_dicom(series_dir: Path) -> Optional[Path]:
+    for p in iter_dicom_candidates(series_dir):
+        try:
+            read_dicom_header(p)
+            return p
+        except Exception:
+            continue
+    return None
 
 
 def get_value(ds, name: str) -> str:
@@ -193,23 +193,6 @@ def safe_int(value, default: int = 999999) -> int:
 def sort_time(value: str) -> str:
     value = str(value or "").strip()
     return value if value else "999999"
-
-
-def looks_like_series_dir(path: Path) -> bool:
-    return first_readable_dicom(path) is not None
-
-
-def looks_like_subject_session_dir(path: Path) -> bool:
-    """A subject/session dir contains series subdirs with DICOMs."""
-    if looks_like_series_dir(path):
-        return False
-    try:
-        for child in path.iterdir():
-            if child.is_dir() and looks_like_series_dir(child):
-                return True
-    except Exception:
-        return False
-    return False
 
 
 def normalize_session_label(session: str) -> str:
@@ -258,44 +241,80 @@ def infer_subject_session(input_dir: Path, raw_root: Optional[Path] = None) -> T
     return subject, session
 
 
-def subject_session_dirs_fast(raw_root: Path, session_filters: Optional[List[str]] = None) -> List[Path]:
+def discover_session_dirs_by_glob(raw_root: Path, session_filters: Optional[List[str]]) -> List[Path]:
     """
-    Fast dcm2dir-aware discovery.
+    Trust the expected raw layout first.
 
-    Expected forms:
-      raw_root/subject/session/series/*.dcm
-      raw_root/subject/series/*.dcm
+    This directly supports:
+        raw_root/sub-*/ses-001
+        raw_root/<subject>/ses-001
     """
     found = []
 
+    if session_filters:
+        # Use explicit session globs first; this avoids walking the entire tree.
+        for s in session_filters:
+            s_norm = normalize_session_label(s)
+            session_name = s_norm  # normalize_session_label returns ses-*
+            found.extend(p for p in raw_root.glob(f"*/{session_name}") if p.is_dir())
+
+            # Also try the exact user-provided label in case it is non-standard.
+            s_raw = str(s).strip()
+            if s_raw and s_raw != session_name:
+                found.extend(p for p in raw_root.glob(f"*/{s_raw}") if p.is_dir())
+    else:
+        # Common session layout.
+        found.extend(p for p in raw_root.glob("*/ses-*") if p.is_dir())
+
+        # No-session layout: raw_root/subject/series/*.dcm
+        for p in raw_root.iterdir() if raw_root.exists() else []:
+            if p.is_dir() and list_series_dirs(p):
+                found.append(p)
+
+    return sorted(set(found))
+
+
+def subject_session_dirs_fallback_walk(raw_root: Path, session_filters: Optional[List[str]]) -> List[Path]:
+    """
+    Slower fallback for unusual nesting. Finds directories that contain DICOM series folders.
+    """
     wanted = None
     if session_filters:
         wanted = {normalize_session_label(s) for s in session_filters}
 
-    try:
-        subject_dirs = [p for p in raw_root.iterdir() if p.is_dir()]
-    except Exception:
-        subject_dirs = []
+    found = []
+    for dirpath, dirnames, _ in os.walk(raw_root):
+        path = Path(dirpath)
+        subject, session = infer_subject_session(path, raw_root=raw_root)
 
-    for subject_dir in sorted(subject_dirs):
-        # No-session layout: raw_root/subject/series/*.dcm
-        if wanted is None and looks_like_subject_session_dir(subject_dir):
-            found.append(subject_dir)
+        if wanted is not None and normalize_session_label(session) not in wanted:
+            # If this directory itself looks like a nonmatching session, prune it.
+            if path.name.lower().startswith("ses-"):
+                dirnames[:] = []
             continue
 
-        # Session layout: raw_root/subject/session/series/*.dcm
-        try:
-            children = [p for p in subject_dir.iterdir() if p.is_dir()]
-        except Exception:
-            continue
-
-        for session_dir in sorted(children):
-            if wanted is not None and normalize_session_label(session_dir.name) not in wanted:
-                continue
-            if looks_like_subject_session_dir(session_dir):
-                found.append(session_dir)
+        if list_series_dirs(path):
+            found.append(path)
+            dirnames[:] = []
 
     return sorted(set(found))
+
+
+def subject_session_dirs(raw_root: Path, session_filters: Optional[List[str]] = None) -> List[Path]:
+    """
+    Find subject/session directories.
+
+    The fast path uses direct globbing such as raw_root/*/ses-001.
+    The fallback walks only if direct globbing finds nothing usable.
+    """
+    candidates = discover_session_dirs_by_glob(raw_root, session_filters)
+
+    usable = [p for p in candidates if list_series_dirs(p)]
+    if usable:
+        return sorted(set(usable))
+
+    # If globbed sessions exist but list_series_dirs failed, still try fallback.
+    return subject_session_dirs_fallback_walk(raw_root, session_filters)
 
 
 def output_path_for(output_dir: Path, subject: str, session: str) -> Path:
@@ -306,14 +325,34 @@ def output_path_for(output_dir: Path, subject: str, session: str) -> Path:
 
 
 def list_series_dirs(input_dir: Path) -> List[Path]:
-    series_dirs = []
+    """
+    Return DICOM-containing series folders under a subject/session directory.
+
+    First checks direct children, as produced by dcm2dir.
+    If none are found, falls back to a recursive search for DICOM-containing folders.
+    This handles an extra nesting level without requiring a full raw-root scan.
+    """
+    direct = []
     try:
         for child in input_dir.iterdir():
-            if child.is_dir() and looks_like_series_dir(child):
-                series_dirs.append(child)
+            if child.is_dir() and first_readable_dicom(child) is not None:
+                direct.append(child)
     except Exception:
         pass
-    return sorted(series_dirs)
+
+    if direct:
+        return sorted(direct)
+
+    recursive = []
+    for dirpath, dirnames, _ in os.walk(input_dir):
+        path = Path(dirpath)
+        if path == input_dir:
+            continue
+        if first_readable_dicom(path) is not None:
+            recursive.append(path)
+            dirnames[:] = []
+
+    return sorted(set(recursive))
 
 
 def count_candidate_files(series_dir: Path) -> int:
@@ -495,9 +534,15 @@ def main(argv=None) -> int:
         return 2
 
     if args.batch:
-        subject_dirs = subject_session_dirs_fast(input_dir, session_filters=args.session_filter)
+        subject_dirs = subject_session_dirs(input_dir, session_filters=args.session_filter)
         if not subject_dirs:
             print(f"ERROR: no subject/session DICOM directories found under {input_dir}", file=sys.stderr)
+            if args.session_filter:
+                wanted = ", ".join(args.session_filter)
+                print(
+                    f"Hint: expected paths like {input_dir}/sub-*/{wanted}/<series>/*.dcm",
+                    file=sys.stderr,
+                )
             return 1
 
         if args.session_filter:

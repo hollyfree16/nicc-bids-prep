@@ -35,6 +35,9 @@ Single subject/session:
 Entire raw-data root:
     python query_series.py --input-dir /raw --output-dir /logs --batch
 
+Only one session from a raw-data root:
+    python query_series.py --input-dir /raw --output-dir /logs --batch --session-filter ses-001
+
 Overwrite existing TSVs:
     python query_series.py --input-dir /raw --output-dir /logs --batch --force
 """
@@ -311,6 +314,18 @@ def output_path_for(output_dir: Path, subject: str, session: str) -> Path:
     return output_dir / f"{tag}_series.tsv"
 
 
+def normalize_session_label(session: str) -> str:
+    """Normalize session labels so ses-001 and 001 compare equal."""
+    s = str(session or "").strip()
+    if not s:
+        return ""
+    if s.lower().startswith("ses-"):
+        s = s[4:]
+    return f"ses-{s}".casefold()
+
+
+
+
 def write_subject_tsv(
     input_dir: Path,
     output_dir: Path,
@@ -362,6 +377,15 @@ def build_parser():
     p.add_argument("--batch", action="store_true")
     p.add_argument("--subject", default=None)
     p.add_argument("--session", default=None)
+    p.add_argument(
+        "--session-filter",
+        action="append",
+        default=None,
+        help=(
+            "Batch mode only: process only matching session labels, e.g. ses-001. "
+            "Can be supplied more than once. Matching is case-insensitive and accepts 001 or ses-001."
+        ),
+    )
     p.add_argument("--force", action="store_true")
     return p
 
@@ -381,6 +405,20 @@ def main(argv=None) -> int:
         if not subject_dirs:
             print(f"ERROR: no subject/session DICOM directories found under {input_dir}", file=sys.stderr)
             return 1
+
+        if args.session_filter:
+            wanted = {normalize_session_label(s) for s in args.session_filter}
+            before = len(subject_dirs)
+            filtered = []
+            for subject_dir in subject_dirs:
+                _, inferred_session = infer_subject_session(subject_dir, raw_root=input_dir)
+                if normalize_session_label(inferred_session) in wanted:
+                    filtered.append(subject_dir)
+            subject_dirs = filtered
+            print(
+                f"[INFO] Session filter {sorted(wanted)}: "
+                f"{len(subject_dirs)} of {before} subject/session directories selected"
+            )
 
         print(f"[INFO] Found {len(subject_dirs)} subject/session directories under {input_dir}")
         n_written = 0

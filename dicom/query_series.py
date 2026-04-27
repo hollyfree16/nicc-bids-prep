@@ -3,9 +3,9 @@
 query_series.py
 ===============
 
-Generate per-subject/per-session TSV inventories from DICOM series folders.
+Fast per-subject/per-session DICOM series inventory.
 
-Designed for DICOM directories staged by dicom/dcm2dir, where the standard layout is:
+Designed for DICOM directories staged by dicom/dcm2dir:
 
     RAW_ROOT/
         SubjectID/
@@ -13,33 +13,39 @@ Designed for DICOM directories staged by dicom/dcm2dir, where the standard layou
                 <SeriesDescription>_<SeriesNumber>/
                     *.dcm
 
-or, for no session:
+or:
 
     RAW_ROOT/
         SubjectID/
             <SeriesDescription>_<SeriesNumber>/
                 *.dcm
 
-The script can run on:
-  1. A single subject/session directory.
-  2. A raw-data root containing many subjects/sessions.
+Default mode is fast:
+  - treats each dcm2dir series folder as one series
+  - counts files in that folder
+  - reads one representative DICOM header per series
+  - preserves scan order using SeriesNumber/AcquisitionTime/SeriesTime
 
-Outputs one TSV per subject/session. Each row is one DICOM series, ordered by
-SeriesNumber/AcquisitionTime so duplicates, partial scans, and reruns are easier to review.
+Optional deep QC:
+  - --check-instances reads every DICOM in each series to detect missing instance numbers
+  - this is slower and should only be used when needed
 
-Usage
------
+Examples
+--------
 Single subject/session:
-    python query_series.py --input-dir /raw/sub-001/ses-001 --output-dir /logs
+    python query_series.py --input-dir /raw/mri/sub-001/ses-001 --output-dir /logs
 
-Entire raw-data root:
-    python query_series.py --input-dir /raw --output-dir /logs --batch
+Batch all sessions:
+    python query_series.py --input-dir /raw/mri --output-dir /logs --batch
 
-Only one session from a raw-data root:
-    python query_series.py --input-dir /raw --output-dir /logs --batch --session-filter ses-001
+Batch only ses-001:
+    python query_series.py --input-dir /raw/mri --output-dir /logs --batch --session-filter ses-001
 
-Overwrite existing TSVs:
-    python query_series.py --input-dir /raw --output-dir /logs --batch --force
+Regenerate existing TSVs:
+    python query_series.py --input-dir /raw/mri --output-dir /logs --batch --force
+
+Run slower instance-number QC:
+    python query_series.py --input-dir /raw/mri --output-dir /logs --batch --check-instances
 """
 
 from __future__ import annotations
@@ -49,15 +55,64 @@ import csv
 import os
 import re
 import sys
-from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import pydicom
 
 
 DICOM_EXTENSIONS = {".dcm", ".ima", ""}
+
+HEADER_TAGS = [
+    "StudyDate",
+    "SeriesDate",
+    "AcquisitionDate",
+    "SeriesTime",
+    "AcquisitionTime",
+    "SeriesNumber",
+    "SeriesInstanceUID",
+    "SeriesDescription",
+    "ProtocolName",
+    "SequenceName",
+    "ImageType",
+    "EchoTime",
+    "EchoNumber",
+    "RepetitionTime",
+    "PhaseEncodingDirection",
+    "InPlanePhaseEncodingDirection",
+    "InstanceNumber",
+]
+
+
+FIELDNAMES = [
+    "subject",
+    "session",
+    "scan_date",
+    "study_date",
+    "series_date",
+    "acquisition_date",
+    "series_time",
+    "acquisition_time",
+    "series_number",
+    "series_instance_uid",
+    "series_description",
+    "protocol_name",
+    "sequence_name",
+    "image_type",
+    "echo_time",
+    "echo_number",
+    "repetition_time",
+    "phase_encoding_direction",
+    "inplane_phase_encoding_direction",
+    "n_files",
+    "min_instance_number",
+    "max_instance_number",
+    "n_unique_instance_numbers",
+    "partial_flag",
+    "series_dir",
+    "example_dicom",
+]
 
 
 def is_probable_dicom_file(path: Path) -> bool:
@@ -68,8 +123,37 @@ def is_probable_dicom_file(path: Path) -> bool:
     return path.suffix.lower() in DICOM_EXTENSIONS
 
 
+def iter_dicom_candidates(series_dir: Path) -> Iterable[Path]:
+    """dcm2dir writes DICOMs directly inside each series folder."""
+    try:
+        for p in series_dir.iterdir():
+            if is_probable_dicom_file(p):
+                yield p
+    except Exception:
+        return
+
+
+def first_readable_dicom(series_dir: Path) -> Optional[Path]:
+    for p in iter_dicom_candidates(series_dir):
+        try:
+            read_dicom_header(p)
+            return p
+        except Exception:
+            continue
+    return None
+
+
 def read_dicom_header(path: Path):
-    return pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
+    try:
+        return pydicom.dcmread(
+            str(path),
+            stop_before_pixels=True,
+            force=True,
+            specific_tags=HEADER_TAGS,
+        )
+    except TypeError:
+        # Older pydicom compatibility.
+        return pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
 
 
 def get_value(ds, name: str) -> str:
@@ -111,143 +195,12 @@ def sort_time(value: str) -> str:
     return value if value else "999999"
 
 
-def find_dicom_files(root: Path) -> Iterable[Path]:
-    for dirpath, _, filenames in os.walk(root):
-        for name in filenames:
-            path = Path(dirpath) / name
-            if is_probable_dicom_file(path):
-                yield path
-
-
-def group_by_series(input_dir: Path) -> Dict[str, Dict]:
-    series = defaultdict(lambda: {
-        "files": [],
-        "example_dicom": "",
-        "header": None,
-    })
-
-    for path in find_dicom_files(input_dir):
-        try:
-            ds = read_dicom_header(path)
-        except Exception:
-            continue
-
-        uid = get_value(ds, "SeriesInstanceUID")
-        if not uid:
-            uid = f"NO_UID::{path.parent}"
-
-        row = series[uid]
-        row["files"].append(path)
-        if not row["example_dicom"]:
-            row["example_dicom"] = str(path)
-        if row["header"] is None:
-            row["header"] = ds
-
-    return dict(series)
-
-
-def summarize_series(uid: str, meta: Dict, subject: str, session: str) -> Dict[str, str]:
-    ds = meta["header"]
-    files = sorted(meta["files"])
-
-    study_date = format_dicom_date(get_value(ds, "StudyDate"))
-    series_date = format_dicom_date(get_value(ds, "SeriesDate"))
-    acq_date = format_dicom_date(get_value(ds, "AcquisitionDate"))
-    scan_date = study_date or series_date or acq_date
-
-    instance_numbers = []
-    for f in files:
-        try:
-            h = read_dicom_header(f)
-            inst = safe_int(get_value(h, "InstanceNumber"), default=-1)
-            if inst >= 0:
-                instance_numbers.append(inst)
-        except Exception:
-            continue
-
-    min_instance = min(instance_numbers) if instance_numbers else ""
-    max_instance = max(instance_numbers) if instance_numbers else ""
-    n_unique_instances = len(set(instance_numbers)) if instance_numbers else ""
-
-    n_files = len(files)
-    partial_flag = ""
-    if instance_numbers:
-        expected_span = max(instance_numbers) - min(instance_numbers) + 1
-        if expected_span > n_unique_instances:
-            partial_flag = "missing_instance_numbers"
-        elif n_files < 5:
-            partial_flag = "very_few_files"
-    elif n_files < 5:
-        partial_flag = "very_few_files"
-
-    return {
-        "subject": subject,
-        "session": session,
-        "scan_date": scan_date,
-        "study_date": study_date,
-        "series_date": series_date,
-        "acquisition_date": acq_date,
-        "series_time": get_value(ds, "SeriesTime"),
-        "acquisition_time": get_value(ds, "AcquisitionTime"),
-        "series_number": get_value(ds, "SeriesNumber"),
-        "series_instance_uid": uid,
-        "series_description": get_value(ds, "SeriesDescription"),
-        "protocol_name": get_value(ds, "ProtocolName"),
-        "sequence_name": get_value(ds, "SequenceName"),
-        "image_type": get_value(ds, "ImageType"),
-        "echo_time": get_value(ds, "EchoTime"),
-        "echo_number": get_value(ds, "EchoNumber"),
-        "repetition_time": get_value(ds, "RepetitionTime"),
-        "phase_encoding_direction": get_value(ds, "PhaseEncodingDirection"),
-        "inplane_phase_encoding_direction": get_value(ds, "InPlanePhaseEncodingDirection"),
-        "n_files": str(n_files),
-        "min_instance_number": str(min_instance),
-        "max_instance_number": str(max_instance),
-        "n_unique_instance_numbers": str(n_unique_instances),
-        "partial_flag": partial_flag,
-        "series_dir": str(Path(files[0]).parent) if files else "",
-        "example_dicom": meta["example_dicom"],
-    }
-
-
-FIELDNAMES = [
-    "subject",
-    "session",
-    "scan_date",
-    "study_date",
-    "series_date",
-    "acquisition_date",
-    "series_time",
-    "acquisition_time",
-    "series_number",
-    "series_instance_uid",
-    "series_description",
-    "protocol_name",
-    "sequence_name",
-    "image_type",
-    "echo_time",
-    "echo_number",
-    "repetition_time",
-    "phase_encoding_direction",
-    "inplane_phase_encoding_direction",
-    "n_files",
-    "min_instance_number",
-    "max_instance_number",
-    "n_unique_instance_numbers",
-    "partial_flag",
-    "series_dir",
-    "example_dicom",
-]
-
-
 def looks_like_series_dir(path: Path) -> bool:
-    try:
-        return any(is_probable_dicom_file(p) for p in path.iterdir() if p.is_file())
-    except Exception:
-        return False
+    return first_readable_dicom(path) is not None
 
 
 def looks_like_subject_session_dir(path: Path) -> bool:
+    """A subject/session dir contains series subdirs with DICOMs."""
     if looks_like_series_dir(path):
         return False
     try:
@@ -259,21 +212,28 @@ def looks_like_subject_session_dir(path: Path) -> bool:
     return False
 
 
+def normalize_session_label(session: str) -> str:
+    s = str(session or "").strip()
+    if not s:
+        return ""
+    if s.lower().startswith("ses-"):
+        s = s[4:]
+    return f"ses-{s}".casefold()
+
+
 def infer_subject_session(input_dir: Path, raw_root: Optional[Path] = None) -> Tuple[str, str]:
     input_dir = input_dir.resolve()
-    parts = list(input_dir.parts)
-
     subject = ""
     session = ""
 
-    for p in reversed(parts):
-        if re.match(r"^sub-[A-Za-z0-9]+", p, re.IGNORECASE):
-            subject = p
-            break
-
+    parts = list(input_dir.parts)
     for p in reversed(parts):
         if re.match(r"^ses-[A-Za-z0-9]+", p, re.IGNORECASE):
             session = p
+            break
+    for p in reversed(parts):
+        if re.match(r"^sub-[A-Za-z0-9]+", p, re.IGNORECASE):
+            subject = p
             break
 
     if not subject and raw_root:
@@ -288,6 +248,7 @@ def infer_subject_session(input_dir: Path, raw_root: Optional[Path] = None) -> T
             pass
 
     if not subject:
+        # Single-subject mode fallback.
         if input_dir.parent != input_dir:
             subject = input_dir.parent.name
             session = input_dir.name
@@ -297,13 +258,43 @@ def infer_subject_session(input_dir: Path, raw_root: Optional[Path] = None) -> T
     return subject, session
 
 
-def discover_subject_session_dirs(raw_root: Path) -> List[Path]:
+def subject_session_dirs_fast(raw_root: Path, session_filters: Optional[List[str]] = None) -> List[Path]:
+    """
+    Fast dcm2dir-aware discovery.
+
+    Expected forms:
+      raw_root/subject/session/series/*.dcm
+      raw_root/subject/series/*.dcm
+    """
     found = []
-    for dirpath, dirnames, _ in os.walk(raw_root):
-        path = Path(dirpath)
-        if looks_like_subject_session_dir(path):
-            found.append(path)
-            dirnames[:] = []
+
+    wanted = None
+    if session_filters:
+        wanted = {normalize_session_label(s) for s in session_filters}
+
+    try:
+        subject_dirs = [p for p in raw_root.iterdir() if p.is_dir()]
+    except Exception:
+        subject_dirs = []
+
+    for subject_dir in sorted(subject_dirs):
+        # No-session layout: raw_root/subject/series/*.dcm
+        if wanted is None and looks_like_subject_session_dir(subject_dir):
+            found.append(subject_dir)
+            continue
+
+        # Session layout: raw_root/subject/session/series/*.dcm
+        try:
+            children = [p for p in subject_dir.iterdir() if p.is_dir()]
+        except Exception:
+            continue
+
+        for session_dir in sorted(children):
+            if wanted is not None and normalize_session_label(session_dir.name) not in wanted:
+                continue
+            if looks_like_subject_session_dir(session_dir):
+                found.append(session_dir)
+
     return sorted(set(found))
 
 
@@ -314,16 +305,110 @@ def output_path_for(output_dir: Path, subject: str, session: str) -> Path:
     return output_dir / f"{tag}_series.tsv"
 
 
-def normalize_session_label(session: str) -> str:
-    """Normalize session labels so ses-001 and 001 compare equal."""
-    s = str(session or "").strip()
-    if not s:
-        return ""
-    if s.lower().startswith("ses-"):
-        s = s[4:]
-    return f"ses-{s}".casefold()
+def list_series_dirs(input_dir: Path) -> List[Path]:
+    series_dirs = []
+    try:
+        for child in input_dir.iterdir():
+            if child.is_dir() and looks_like_series_dir(child):
+                series_dirs.append(child)
+    except Exception:
+        pass
+    return sorted(series_dirs)
 
 
+def count_candidate_files(series_dir: Path) -> int:
+    return sum(1 for _ in iter_dicom_candidates(series_dir))
+
+
+def inspect_instances(series_dir: Path) -> Tuple[str, str, str, str]:
+    """
+    Slow optional QC. Reads every DICOM in the series folder.
+    Returns min, max, n_unique, partial_flag.
+    """
+    instance_numbers = []
+    n_files = 0
+
+    for path in iter_dicom_candidates(series_dir):
+        n_files += 1
+        try:
+            ds = read_dicom_header(path)
+            inst = safe_int(get_value(ds, "InstanceNumber"), default=-1)
+            if inst >= 0:
+                instance_numbers.append(inst)
+        except Exception:
+            continue
+
+    partial_flag = ""
+    if instance_numbers:
+        min_instance = min(instance_numbers)
+        max_instance = max(instance_numbers)
+        n_unique = len(set(instance_numbers))
+        expected_span = max_instance - min_instance + 1
+        if expected_span > n_unique:
+            partial_flag = "missing_instance_numbers"
+        elif n_files < 5:
+            partial_flag = "very_few_files"
+        return str(min_instance), str(max_instance), str(n_unique), partial_flag
+
+    if n_files < 5:
+        partial_flag = "very_few_files"
+    return "", "", "", partial_flag
+
+
+def summarize_series_dir(series_dir: Path, subject: str, session: str, check_instances: bool) -> Optional[dict]:
+    example = first_readable_dicom(series_dir)
+    if example is None:
+        return None
+
+    try:
+        ds = read_dicom_header(example)
+    except Exception:
+        return None
+
+    study_date = format_dicom_date(get_value(ds, "StudyDate"))
+    series_date = format_dicom_date(get_value(ds, "SeriesDate"))
+    acq_date = format_dicom_date(get_value(ds, "AcquisitionDate"))
+    scan_date = study_date or series_date or acq_date
+
+    n_files = count_candidate_files(series_dir)
+
+    min_instance = ""
+    max_instance = ""
+    n_unique_instances = ""
+    partial_flag = ""
+    if check_instances:
+        min_instance, max_instance, n_unique_instances, partial_flag = inspect_instances(series_dir)
+    elif n_files < 5:
+        partial_flag = "very_few_files"
+
+    return {
+        "subject": subject,
+        "session": session,
+        "scan_date": scan_date,
+        "study_date": study_date,
+        "series_date": series_date,
+        "acquisition_date": acq_date,
+        "series_time": get_value(ds, "SeriesTime"),
+        "acquisition_time": get_value(ds, "AcquisitionTime"),
+        "series_number": get_value(ds, "SeriesNumber"),
+        "series_instance_uid": get_value(ds, "SeriesInstanceUID"),
+        "series_description": get_value(ds, "SeriesDescription"),
+        "protocol_name": get_value(ds, "ProtocolName"),
+        "sequence_name": get_value(ds, "SequenceName"),
+        "image_type": get_value(ds, "ImageType"),
+        "echo_time": get_value(ds, "EchoTime"),
+        "echo_number": get_value(ds, "EchoNumber"),
+        "repetition_time": get_value(ds, "RepetitionTime"),
+        "phase_encoding_direction": get_value(ds, "PhaseEncodingDirection"),
+        "inplane_phase_encoding_direction": get_value(ds, "InPlanePhaseEncodingDirection"),
+        "n_files": str(n_files),
+        "min_instance_number": min_instance,
+        "max_instance_number": max_instance,
+        "n_unique_instance_numbers": n_unique_instances,
+        "partial_flag": partial_flag,
+        "series_dir": str(series_dir),
+        "example_dicom": str(example),
+    }
 
 
 def write_subject_tsv(
@@ -333,6 +418,7 @@ def write_subject_tsv(
     session: Optional[str] = None,
     raw_root: Optional[Path] = None,
     force: bool = False,
+    check_instances: bool = False,
 ) -> Optional[Path]:
     inferred_subject, inferred_session = infer_subject_session(input_dir, raw_root=raw_root)
     subject = subject or inferred_subject
@@ -345,12 +431,12 @@ def write_subject_tsv(
         print(f"[SKIP] {subject} {session or ''}: existing TSV found: {out_tsv}")
         return None
 
-    series = group_by_series(input_dir)
-    rows = [
-        summarize_series(uid, meta, subject, session)
-        for uid, meta in series.items()
-        if meta.get("header") is not None
-    ]
+    series_dirs = list_series_dirs(input_dir)
+    rows = []
+    for series_dir in series_dirs:
+        row = summarize_series_dir(series_dir, subject, session, check_instances=check_instances)
+        if row is not None:
+            rows.append(row)
 
     rows.sort(key=lambda r: (
         safe_int(r["series_number"]),
@@ -387,6 +473,14 @@ def build_parser():
         ),
     )
     p.add_argument("--force", action="store_true")
+    p.add_argument(
+        "--check-instances",
+        action="store_true",
+        help=(
+            "Slower QC mode: read every DICOM in each series to compute min/max/unique "
+            "InstanceNumber and flag missing instance-number gaps."
+        ),
+    )
     return p
 
 
@@ -401,26 +495,17 @@ def main(argv=None) -> int:
         return 2
 
     if args.batch:
-        subject_dirs = discover_subject_session_dirs(input_dir)
+        subject_dirs = subject_session_dirs_fast(input_dir, session_filters=args.session_filter)
         if not subject_dirs:
             print(f"ERROR: no subject/session DICOM directories found under {input_dir}", file=sys.stderr)
             return 1
 
         if args.session_filter:
-            wanted = {normalize_session_label(s) for s in args.session_filter}
-            before = len(subject_dirs)
-            filtered = []
-            for subject_dir in subject_dirs:
-                _, inferred_session = infer_subject_session(subject_dir, raw_root=input_dir)
-                if normalize_session_label(inferred_session) in wanted:
-                    filtered.append(subject_dir)
-            subject_dirs = filtered
-            print(
-                f"[INFO] Session filter {sorted(wanted)}: "
-                f"{len(subject_dirs)} of {before} subject/session directories selected"
-            )
+            wanted = sorted({normalize_session_label(s) for s in args.session_filter})
+            print(f"[INFO] Session filter {wanted}: {len(subject_dirs)} subject/session directories selected")
+        else:
+            print(f"[INFO] Found {len(subject_dirs)} subject/session directories under {input_dir}")
 
-        print(f"[INFO] Found {len(subject_dirs)} subject/session directories under {input_dir}")
         n_written = 0
         n_skipped = 0
         for subject_dir in subject_dirs:
@@ -429,6 +514,7 @@ def main(argv=None) -> int:
                 output_dir=output_dir,
                 raw_root=input_dir,
                 force=args.force,
+                check_instances=args.check_instances,
             )
             if result is None:
                 n_skipped += 1
@@ -445,6 +531,7 @@ def main(argv=None) -> int:
         session=args.session,
         raw_root=None,
         force=args.force,
+        check_instances=args.check_instances,
     )
     print(f"[SUMMARY] written={1 if result else 0} skipped_existing={1 if result is None else 0}")
     return 0

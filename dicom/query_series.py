@@ -242,7 +242,8 @@ def output_path_for(output_dir: Path, subject: str, session: str) -> Path:
     return output_dir / f"{tag}_series.tsv"
 
 
-def list_series_dirs(input_dir: Path, verbose: bool = False) -> List[Path]:
+def list_series_dirs(input_dir: Path, verbose: bool = False) -> List[Tuple[Path, Path, int]]:
+    """Return (series_dir, example_dicom, n_files) for each readable series."""
     direct = []
     children = []
     try:
@@ -255,8 +256,8 @@ def list_series_dirs(input_dir: Path, verbose: bool = False) -> List[Path]:
         log(f"[DEBUG] {input_dir}: {len(children)} child directories")
 
     for child in children:
-        # Do not require successful read twice unless needed for validation.
-        n_files = sum(1 for _ in iter_dicom_candidates(child))
+        candidates = list(iter_dicom_candidates(child))
+        n_files = len(candidates)
         if n_files == 0:
             if verbose:
                 log(f"[DEBUG] {child.name}: no candidate DICOM files")
@@ -264,30 +265,33 @@ def list_series_dirs(input_dir: Path, verbose: bool = False) -> List[Path]:
 
         example = first_readable_dicom(child, verbose=verbose)
         if example is not None:
-            direct.append(child)
+            direct.append((child, example, n_files))
         elif verbose:
             warn(f"[WARN] {child.name}: {n_files} candidate DICOM files but no readable header")
 
     if direct:
-        return sorted(direct)
+        return sorted(direct, key=lambda t: t[0])
 
     # Fallback: some layouts have one extra nesting level.
     recursive = []
+    seen = set()
     for dirpath, dirnames, _ in os.walk(input_dir):
         path = Path(dirpath)
         if path == input_dir:
             continue
 
-        n_files = sum(1 for _ in iter_dicom_candidates(path))
+        candidates = list(iter_dicom_candidates(path))
+        n_files = len(candidates)
         if n_files == 0:
             continue
 
         example = first_readable_dicom(path, verbose=verbose)
-        if example is not None:
-            recursive.append(path)
+        if example is not None and path not in seen:
+            recursive.append((path, example, n_files))
+            seen.add(path)
             dirnames[:] = []
 
-    return sorted(set(recursive))
+    return sorted(recursive, key=lambda t: t[0])
 
 
 def count_candidate_files(series_dir: Path) -> int:
@@ -325,8 +329,16 @@ def inspect_instances(series_dir: Path) -> Tuple[str, str, str, str]:
     return "", "", "", partial_flag
 
 
-def summarize_series_dir(series_dir: Path, subject: str, session: str, check_instances: bool) -> Optional[dict]:
-    example = first_readable_dicom(series_dir)
+def summarize_series_dir(
+    series_dir: Path,
+    subject: str,
+    session: str,
+    check_instances: bool,
+    example: Optional[Path] = None,
+    n_files: Optional[int] = None,
+) -> Optional[dict]:
+    if example is None:
+        example = first_readable_dicom(series_dir)
     if example is None:
         return None
 
@@ -340,7 +352,8 @@ def summarize_series_dir(series_dir: Path, subject: str, session: str, check_ins
     acq_date = format_dicom_date(get_value(ds, "AcquisitionDate"))
     scan_date = study_date or series_date or acq_date
 
-    n_files = count_candidate_files(series_dir)
+    if n_files is None:
+        n_files = count_candidate_files(series_dir)
 
     min_instance = ""
     max_instance = ""
@@ -402,20 +415,21 @@ def write_subject_tsv(
         log(f"[SKIP] {subject} {session or ''}: existing TSV found: {out_tsv}")
         return "skipped", None, 0
 
-    series_dirs = list_series_dirs(input_dir, verbose=verbose)
-    log(f"[SERIES] {subject} {session or ''}: found {len(series_dirs)} series folders")
+    series_entries = list_series_dirs(input_dir, verbose=verbose)
+    log(f"[SERIES] {subject} {session or ''}: found {len(series_entries)} series folders")
 
-    if not series_dirs:
+    if not series_entries:
         warn(f"[WARN] {subject} {session or ''}: no readable DICOM series folders found under {input_dir}")
         if verbose:
             warn("[WARN] Try checking the first child directory manually with pydicom.dcmread(..., stop_before_pixels=True, force=True)")
         return "no_series", None, 0
 
     rows = []
-    for i, series_dir in enumerate(series_dirs, start=1):
-        if i == 1 or i == len(series_dirs) or i % 10 == 0:
-            log(f"[READ] {subject} {session or ''}: series {i}/{len(series_dirs)}")
-        row = summarize_series_dir(series_dir, subject, session, check_instances=check_instances)
+    for i, (series_dir, example, n_files) in enumerate(series_entries, start=1):
+        if i == 1 or i == len(series_entries) or i % 10 == 0:
+            log(f"[READ] {subject} {session or ''}: series {i}/{len(series_entries)}")
+        row = summarize_series_dir(series_dir, subject, session, check_instances=check_instances,
+                                   example=example, n_files=n_files)
         if row is not None:
             rows.append(row)
 

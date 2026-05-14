@@ -1,1 +1,6 @@
 __pycache__/
+CLAUDE.md
+.DS_STORE
+docs/
+testing/
+_parking/

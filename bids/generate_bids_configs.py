@@ -115,22 +115,32 @@ def always_ignore(desc):
 # ============================================================================
 
 RERUN_RE        = re.compile(r"[_\s]+(rr|rerun|repeat|redo|2nd)($|(?=_))", re.IGNORECASE)
+RERUN_DOT_RE    = re.compile(r"\.\d+$")   # e.g. EMOTION_SMS4_1.2
 RERUN_PREFIX_RE = re.compile(r"^Repeat_", re.IGNORECASE)
 
 
 def is_rerun(desc):
-    return bool(RERUN_RE.search(desc)) or bool(RERUN_PREFIX_RE.match(desc))
+    return (bool(RERUN_RE.search(desc))
+            or bool(RERUN_PREFIX_RE.match(desc))
+            or bool(RERUN_DOT_RE.search(desc)))
 
 
 def strip_rerun(desc):
     s = RERUN_PREFIX_RE.sub("", desc)
     s = RERUN_RE.sub("", s)
+    s = RERUN_DOT_RE.sub("", s)
     return s.strip("_ ")
 
 
 # ============================================================================
 # TEMPLATE LOADING
 # ============================================================================
+
+def _extract_year(protocol_name):
+    """Pull the 4-digit year out of a protocol_name like 'MGH 2021'."""
+    m = re.search(r'\b(20\d{2})\b', protocol_name)
+    return m.group(1) if m else None
+
 
 def load_templates(templates_dir, site):
     tsv_files = sorted(templates_dir.glob("*.tsv"))
@@ -164,6 +174,7 @@ def load_templates(templates_dir, site):
     templates = []
     for proto_name, rows in proto_rows.items():
         fingerprint, mapping, folder, expected = set(), {}, {}, set()
+        rerun_map = {}   # rerun_desc_cf → base_desc_cf (from explicit is_rerun/rerun_of columns)
         for row in rows:
             desc    = row["series_description"].strip()
             desc_cf = desc.casefold()
@@ -175,18 +186,29 @@ def load_templates(templates_dir, site):
                 expected.add(desc)
             mapping[desc_cf] = bsuffix
             folder[desc_cf]  = bfolder
+            if row.get("is_rerun", "").strip().lower() == "yes":
+                base = row.get("rerun_of", "").strip().casefold()
+                if base:
+                    rerun_map[desc_cf] = base
         templates.append({
-            "name": proto_name, "site": site,
-            "fingerprint": fingerprint, "mapping": mapping,
-            "folder": folder, "expected": expected,
+            "name":       proto_name,
+            "year":       _extract_year(proto_name),
+            "site":       site,
+            "fingerprint": fingerprint,
+            "mapping":    mapping,
+            "folder":     folder,
+            "expected":   expected,
+            "rerun_map":  rerun_map,
         })
 
     print(f"Loaded {len(templates)} template(s) for site '{site}':")
     for t in templates:
-        print(f"  {t['name']}  "
+        yr = f"  year={t['year']}" if t["year"] else ""
+        print(f"  {t['name']}{yr}  "
               f"({len(t['mapping'])} series, "
               f"{len(t['fingerprint'])} fingerprint, "
-              f"{len(t['expected'])} expected)")
+              f"{len(t['expected'])} expected, "
+              f"{len(t['rerun_map'])} reruns)")
     return templates
 
 
@@ -194,10 +216,20 @@ def load_templates(templates_dir, site):
 # PROTOCOL DETECTION
 # ============================================================================
 
-def detect_protocol(series_list, templates):
+def detect_protocol(series_list, templates, scan_year=None):
+    # Year-based matching: if exactly one template matches the subject's scan year, use it.
+    if scan_year:
+        year_matches = [t for t in templates if t.get("year") == scan_year]
+        if len(year_matches) == 1:
+            return year_matches[0], 1.0
+        # Multiple templates for the same year — fall through to fingerprint among them
+        search_pool = year_matches if year_matches else templates
+    else:
+        search_pool = templates
+
     series_cf = {s.casefold() for s in series_list}
     best_score, best_tmpl = -1.0, None
-    for tmpl in templates:
+    for tmpl in search_pool:
         fp = tmpl["fingerprint"]
         if not fp:
             continue
@@ -233,13 +265,15 @@ def resolve_series(series_list, template):
             superseded_implicit.add(i)
 
     superseded_cf = set()
-    rerun_base_cf = {}
+    # Prefer explicit rerun_map from template; augment with regex detection for anything not covered.
+    rerun_base_cf = dict(template.get("rerun_map", {}))
     for desc in series_list:
-        if is_rerun(desc):
-            base_cf = strip_rerun(desc).casefold()
-            rerun_base_cf[desc.casefold()] = base_cf
-            if base_cf in desc_cf:
-                superseded_cf.add(base_cf)
+        cf = desc.casefold()
+        if cf not in rerun_base_cf and is_rerun(desc):
+            rerun_base_cf[cf] = strip_rerun(desc).casefold()
+    for cf, base_cf in rerun_base_cf.items():
+        if base_cf in desc_cf:
+            superseded_cf.add(base_cf)
 
     records = []
     for i, desc in enumerate(series_list):
@@ -383,6 +417,22 @@ def generate_protocol_match_txt(subject, session, tmpl, score, series_list):
 # LOG PARSING
 # ============================================================================
 
+def parse_series_tsv(tsv_path):
+    """Read a per-subject *_series.tsv. Returns (series_list, scan_year)."""
+    series, year = [], None
+    with tsv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            desc = (row.get("series_description") or "").strip()
+            if desc:
+                series.append(desc)
+            if year is None:
+                date = (row.get("scan_date") or row.get("study_date") or "").strip()
+                if date and len(date) >= 4:
+                    year = date[:4]
+    return series, year
+
+
 def parse_log(log_path):
     return [ln.strip()
             for ln in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -425,24 +475,26 @@ def main():
     print(f"Templates dir: {templates_dir}")
     templates = load_templates(templates_dir, args.site)
 
-    # Build file list — single subject or full batch
+    # Build file list — prefer *_series.tsv, fall back to *.txt / *.log
     if args.subject:
-        pattern = f"*sub-{args.subject}*"
+        pattern_tsv = f"*sub-{args.subject}*_series.tsv"
+        pattern_txt = f"*sub-{args.subject}*"
         if args.session:
-            pattern = f"*sub-{args.subject}*ses-{args.session}*"
-        log_files = sorted(logs_dir.glob(pattern))
+            pattern_tsv = f"*sub-{args.subject}*ses-{args.session}*_series.tsv"
+            pattern_txt = f"*sub-{args.subject}*ses-{args.session}*"
+        log_files = sorted(logs_dir.glob(pattern_tsv)) or sorted(logs_dir.glob(pattern_txt))
         if not log_files:
-            print(f"ERROR: No log file found for subject {args.subject} in {logs_dir}", file=sys.stderr)
+            print(f"ERROR: No series file found for subject {args.subject} in {logs_dir}", file=sys.stderr)
             sys.exit(1)
     else:
-        log_files = sorted(logs_dir.glob("*sub-*.txt"))
+        log_files = (sorted(logs_dir.glob("*_series.tsv"))
+                     or sorted(logs_dir.glob("*sub-*.txt"))
+                     or sorted(logs_dir.glob("*sub-*.log")))
         if not log_files:
-            log_files = sorted(logs_dir.glob("*sub-*.log"))
-        if not log_files:
-            print(f"ERROR: No log files found in {logs_dir}", file=sys.stderr)
+            print(f"ERROR: No series files found in {logs_dir}", file=sys.stderr)
             sys.exit(1)
 
-    print(f"Log files    : {len(log_files)}")
+    print(f"Series files : {len(log_files)}")
     print(f"Output dir   : {output_dir}")
     print(f"{'─'*60}\n")
 
@@ -455,19 +507,18 @@ def main():
             print(f"  SKIP (cannot parse subject): {log_path.name}")
             continue
 
-        # Filter by site — only process subjects whose ID contains the site label
-        if args.site.lower() not in subject.lower():
-            n_skipped_site += 1
-            continue
+        if log_path.suffix == ".tsv":
+            series_list, scan_year = parse_series_tsv(log_path)
+        else:
+            series_list, scan_year = parse_log(log_path), None
 
-        series_list = parse_log(log_path)
         tag = f"sub-{subject}_ses-{session}" if session else f"sub-{subject}"
 
         if not series_list:
-            print(f"  SKIP (empty log): {tag}")
+            print(f"  SKIP (empty): {tag}")
             continue
 
-        tmpl, score = detect_protocol(series_list, templates)
+        tmpl, score = detect_protocol(series_list, templates, scan_year=scan_year)
 
         if tmpl is None:
             print(f"  [{tag}]  NO TEMPLATE MATCH")
@@ -551,7 +602,7 @@ def main():
 {'─'*60}
 Output directory   : {output_dir}
 Site               : {args.site}
-Log files found    : {len(log_files)}
+Series files found : {len(log_files)}
 Skipped (wrong site): {n_skipped_site}
 Subjects processed : {len(detection_rows)}
 Total series       : {len(summary_rows)}

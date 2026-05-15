@@ -358,10 +358,14 @@ def generate_mapping_tsv(subject, session, records):
 
 def generate_bids_sh(subject, session, mapping_abs,
                      dicom_template, bids_output, heuristic_path,
-                     dcmconfig=None):
-    ses_line = f" \\\n -ss {session}" if session else ""
+                     dcmconfig=None, strip_dates_script=None):
+    ses = session or ""
+    ses_line = f" \\\n -ss {ses}" if ses else ""
     dcmconfig_line = f" \\\n --dcmconfig {dcmconfig}" if dcmconfig else ""
-    heudiconv_cmd = (
+    bids_subj = f"{bids_output}/sub-{subject}" + (f"/ses-{ses}" if ses else "")
+
+    # Base command without --overwrite (used for retries so completed series are skipped)
+    base_cmd = (
         "heudiconv \\\n"
         f" --dicom_dir_template {dicom_template} \\\n"
         f" -o {bids_output} \\\n"
@@ -369,20 +373,41 @@ def generate_bids_sh(subject, session, mapping_abs,
         " -c dcm2niix \\\n"
         " -b \\\n"
         " --minmeta \\\n"
-        " --overwrite \\\n"
         f" -s {subject}{ses_line}{dcmconfig_line}"
     )
-    return (
+    first_cmd = base_cmd + " \\\n --overwrite"
+
+    header = (
         "#!/bin/bash\n\n"
         f"export HEUDICONV_MAPPING_TSV={mapping_abs}\n\n"
-        "# Run heudiconv with IntendedFor auto-population enabled\n"
-        f"{heudiconv_cmd}\n\n"
-        "if [ $? -ne 0 ]; then\n"
-        f'    echo "[RETRY] sub-{subject} failed — retrying with IntendedFor disabled"\n'
-        "    export HEUDICONV_DISABLE_INTENDED_FOR=1\n"
-        f"    {heudiconv_cmd}\n"
-        "fi\n"
     )
+
+    if strip_dates_script:
+        # Strip-and-retry loop: each iteration converts one more series past a dates error
+        return (
+            header +
+            f"BIDS_SUBJ={bids_subj}\n\n"
+            f"{first_cmd}\n"
+            "RC=$?\n\n"
+            "ITER=0\n"
+            "while [ $RC -ne 0 ] && [ $ITER -lt 30 ]; do\n"
+            f"    python3 {strip_dates_script} \"$BIDS_SUBJ\"\n"
+            f"    {base_cmd}\n"
+            "    RC=$?\n"
+            "    ITER=$((ITER+1))\n"
+            "done\n\n"
+            "exit $RC\n"
+        )
+    else:
+        return (
+            header +
+            f"{first_cmd}\n\n"
+            "if [ $? -ne 0 ]; then\n"
+            f'    echo "[RETRY] sub-{subject} failed — retrying with IntendedFor disabled"\n'
+            "    export HEUDICONV_DISABLE_INTENDED_FOR=1\n"
+            f"    {first_cmd}\n"
+            "fi\n"
+        )
 
 
 def generate_series_resolved_tsv(records):
@@ -552,11 +577,13 @@ def main():
         mapping_path.write_text(generate_mapping_tsv(subject, session or "", records), encoding="utf-8")
 
         sh_path = sub_out / f"{tag}_BIDS.sh"
+        _strip = Path(args.heuristic).resolve().parent.parent / "utils" / "strip_dates.py"
         sh_path.write_text(
             generate_bids_sh(subject, session or "", str(mapping_path.resolve()),
                              args.dicom_template, args.bids_output,
                              str(Path(args.heuristic).resolve()),
-                             dcmconfig=str(Path(args.dcmconfig).resolve()) if args.dcmconfig else None),
+                             dcmconfig=str(Path(args.dcmconfig).resolve()) if args.dcmconfig else None,
+                             strip_dates_script=str(_strip) if _strip.exists() else None),
             encoding="utf-8")
         sh_path.chmod(0o755)
 

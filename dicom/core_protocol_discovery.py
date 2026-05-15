@@ -688,6 +688,8 @@ def run(
         if r["year"]:
             rows_by_year[r["year"]].append(r)
 
+    templates_dir = output_dir / "templates"
+    templates_dir.mkdir(exist_ok=True)
     for yr in years:
         yr_all = rows_by_year.get(yr, [])
         if not yr_all:
@@ -695,8 +697,8 @@ def run(
         yr_kept   = [r for r in yr_all if r["bucket"] != "excluded"]
         yr_ignore = [r for r in yr_all if r["bucket"] == "excluded"]
         fname = f"{yr}_{site}_candidate_template.tsv"
-        write_tsv(output_dir / fname, yr_kept + yr_ignore, TEMPLATE_COLS)
-        print(f"[OUT] {fname}  ({len(yr_kept)} sequences + {len(yr_ignore)} IGNORE)")
+        write_tsv(templates_dir / fname, yr_kept + yr_ignore, TEMPLATE_COLS)
+        print(f"[OUT] templates/{fname}  ({len(yr_kept)} sequences + {len(yr_ignore)} IGNORE)")
 
     # ── Console: year-first summary ───────────────────────────────────────────
     year_range = f"{years[0]}–{years[-1]}" if years else "?"

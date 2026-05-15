@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """
-Minimal heudiconv --anon-cmd script.
-Copies a DICOM file after blanking all date (DA), datetime (DT),
-and time (TM) VR fields so heudiconv's BIDS date check passes.
+Strip date/time fields from BIDS JSON sidecar files.
+Run this after heudiconv if it fails with:
+  ValueError: There must be no dates in .json sidecar
 
-Usage (called automatically by heudiconv):
-    python strip_dates.py <input_dicom> <output_dicom>
+Usage:
+    python strip_dates.py /path/to/BIDS/sub-001/ses-001
+    python strip_dates.py /path/to/BIDS  # entire dataset
 """
-import sys
-import shutil
-import pydicom
+import sys, json, re
+from pathlib import Path
 
-src, dst = sys.argv[1], sys.argv[2]
+root = Path(sys.argv[1])
+_DATE_RE = re.compile(r'Date|Time')
 
-ds = pydicom.dcmread(src, force=True)
-for tag in list(ds.keys()):
+stripped = 0
+for f in root.rglob("*.json"):
     try:
-        if ds[tag].VR in ('DA', 'DT', 'TM'):
-            ds[tag].value = ''
+        data = json.loads(f.read_text())
     except Exception:
-        pass
-ds.save_as(dst)
+        continue
+    cleaned = {k: v for k, v in data.items() if not _DATE_RE.search(k)}
+    if cleaned != data:
+        f.write_text(json.dumps(cleaned, indent=2))
+        print(f"  stripped: {f}")
+        stripped += 1
+
+print(f"\nDone — {stripped} file(s) updated.")

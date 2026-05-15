@@ -358,9 +358,9 @@ def generate_mapping_tsv(subject, session, records):
 
 def generate_bids_sh(subject, session, mapping_abs,
                      dicom_template, bids_output, heuristic_path,
-                     anon_cmd=None):
+                     dcmconfig=None):
     ses_line = f" \\\n -ss {session}" if session else ""
-    anon_line = f" \\\n --anon-cmd {anon_cmd}" if anon_cmd else ""
+    dcmconfig_line = f" \\\n --dcmconfig {dcmconfig}" if dcmconfig else ""
     heudiconv_cmd = (
         "heudiconv \\\n"
         f" --dicom_dir_template {dicom_template} \\\n"
@@ -370,7 +370,7 @@ def generate_bids_sh(subject, session, mapping_abs,
         " -b \\\n"
         " --minmeta \\\n"
         " --overwrite \\\n"
-        f" -s {subject}{ses_line}{anon_line}"
+        f" -s {subject}{ses_line}{dcmconfig_line}"
     )
     return (
         "#!/bin/bash\n\n"
@@ -465,8 +465,8 @@ def main():
     parser.add_argument("--heuristic",      required=True, help="Path to heuristic.py")
     parser.add_argument("--dicom_template", required=True, help="DICOM dir template with {subject} and {session} placeholders")
     parser.add_argument("--bids_output",    required=True, help="BIDS output directory")
-    parser.add_argument("--anon-cmd",       dest="anon_cmd", default=None,
-                        help="Path to anonymization script passed to heudiconv --anon-cmd (e.g. utils/strip_dates.py)")
+    parser.add_argument("--dcmconfig",      dest="dcmconfig", default=None,
+                        help="Path to dcm2niix config JSON passed to heudiconv --dcmconfig (e.g. utils/dcmconfig_bids_anon.json)")
     args = parser.parse_args()
 
     logs_dir      = Path(args.logs_dir)
@@ -556,7 +556,7 @@ def main():
             generate_bids_sh(subject, session or "", str(mapping_path.resolve()),
                              args.dicom_template, args.bids_output,
                              str(Path(args.heuristic).resolve()),
-                             anon_cmd=str(Path(args.anon_cmd).resolve()) if args.anon_cmd else None),
+                             dcmconfig=str(Path(args.dcmconfig).resolve()) if args.dcmconfig else None),
             encoding="utf-8")
         sh_path.chmod(0o755)
 

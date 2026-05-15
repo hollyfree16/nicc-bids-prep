@@ -22,6 +22,8 @@ if LOG_DIR:
     log_path = LOG_DIR / f"{script.stem}.log"
     with open(log_path, "w") as lf:
         result = subprocess.run(["bash", str(script)], stdout=lf, stderr=subprocess.STDOUT)
+    if result.returncode != 0:
+        log_path = log_path.rename(log_path.with_suffix(".FAIL"))
     print(f"Log → {log_path}")
 else:
     result = subprocess.run(["bash", str(script)])

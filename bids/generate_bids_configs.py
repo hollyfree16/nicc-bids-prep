@@ -180,6 +180,7 @@ def load_templates(templates_dir, site):
     for proto_name, rows in proto_rows.items():
         fingerprint, mapping, folder, expected = set(), {}, {}, set()
         rerun_map = {}   # rerun_desc_cf → base_desc_cf (from explicit is_rerun/rerun_of columns)
+        rank = {}        # desc_cf → int bucket_rank (1 = preferred)
         for row in rows:
             desc    = row["series_description"].strip()
             desc_cf = desc.casefold()
@@ -195,6 +196,12 @@ def load_templates(templates_dir, site):
                 base = row.get("rerun_of", "").strip().casefold()
                 if base:
                     rerun_map[desc_cf] = base
+            raw_rank = row.get("bucket_rank", "").strip()
+            if raw_rank.isdigit():
+                rank[desc_cf] = int(raw_rank)
+            raw_n = row.get("n_subjects", "").strip()
+            if raw_n.isdigit():
+                rank[desc_cf + "__n"] = int(raw_n)
         templates.append({
             "name":       proto_name,
             "year":       _extract_year(proto_name),
@@ -204,6 +211,7 @@ def load_templates(templates_dir, site):
             "folder":     folder,
             "expected":   expected,
             "rerun_map":  rerun_map,
+            "rank":       rank,
         })
 
     print(f"Loaded {len(templates)} template(s) for site '{site}':")
@@ -310,6 +318,43 @@ def _rec(desc, status, folder, bids_suffix, is_rerun_, note):
     return {"desc": desc, "status": status, "folder": folder,
             "bids_suffix": bids_suffix, "is_rerun": is_rerun_,
             "note": note, "run": None}
+
+
+def apply_rank_priority(records, template):
+    """When multiple kept records share the same bids_suffix, keep only one:
+    lowest bucket_rank wins; ties go to first occurrence in the series list.
+    If you want multiple runs, embed the run number in the template bids_suffix
+    (e.g. task-rest_run-01_bold) so they don't collide here."""
+    rank_map = template.get("rank", {})
+    groups = defaultdict(list)
+    for i, rec in enumerate(records):
+        if rec["status"] == "keep":
+            groups[rec["bids_suffix"]].append(i)
+    for indices in groups.values():
+        if len(indices) <= 1:
+            continue
+        # Sort by (bucket_rank ASC, n_subjects DESC, original position ASC)
+        ranked = sorted(
+            [
+                (
+                    rank_map.get(records[i]["desc"].casefold(), 999),
+                    -rank_map.get(records[i]["desc"].casefold() + "__n", 0),
+                    i,
+                )
+                for i in indices
+            ]
+        )
+        keep_rank, _, _ = ranked[0]
+        for r, _, i in ranked[1:]:
+            records[i]["status"]      = "ignore"
+            records[i]["folder"]      = "IGNORE"
+            records[i]["bids_suffix"] = "IGNORE"
+            records[i]["note"]        = (
+                f"rank-{r} variant ignored — rank-{keep_rank} variant present"
+                if r != keep_rank else
+                "duplicate suffix — first occurrence kept"
+            )
+    return records
 
 
 def assign_run_numbers(records):
@@ -545,6 +590,7 @@ def main():
                                 "template": tmpl["name"], "confidence": conf_pct, "flag": flag})
 
         records = resolve_series(series_list, tmpl)
+        records = apply_rank_priority(records, tmpl)
         records = assign_run_numbers(records)
 
         series_cf = {s.casefold() for s in series_list}

@@ -357,8 +357,10 @@ def generate_mapping_tsv(subject, session, records):
 
 
 def generate_bids_sh(subject, session, mapping_abs,
-                     dicom_template, bids_output, heuristic_path):
+                     dicom_template, bids_output, heuristic_path,
+                     anon_cmd=None):
     ses_line = f" \\\n -ss {session}" if session else ""
+    anon_line = f" \\\n --anon-cmd {anon_cmd}" if anon_cmd else ""
     heudiconv_cmd = (
         "heudiconv \\\n"
         f" --dicom_dir_template {dicom_template} \\\n"
@@ -368,7 +370,7 @@ def generate_bids_sh(subject, session, mapping_abs,
         " -b \\\n"
         " --minmeta \\\n"
         " --overwrite \\\n"
-        f" -s {subject}{ses_line}"
+        f" -s {subject}{ses_line}{anon_line}"
     )
     return (
         "#!/bin/bash\n\n"
@@ -463,6 +465,8 @@ def main():
     parser.add_argument("--heuristic",      required=True, help="Path to heuristic.py")
     parser.add_argument("--dicom_template", required=True, help="DICOM dir template with {subject} and {session} placeholders")
     parser.add_argument("--bids_output",    required=True, help="BIDS output directory")
+    parser.add_argument("--anon-cmd",       dest="anon_cmd", default=None,
+                        help="Path to anonymization script passed to heudiconv --anon-cmd (e.g. utils/strip_dates.py)")
     args = parser.parse_args()
 
     logs_dir      = Path(args.logs_dir)
@@ -550,7 +554,9 @@ def main():
         sh_path = sub_out / f"{tag}_BIDS.sh"
         sh_path.write_text(
             generate_bids_sh(subject, session or "", str(mapping_path.resolve()),
-                             args.dicom_template, args.bids_output, args.heuristic),
+                             args.dicom_template, args.bids_output,
+                             str(Path(args.heuristic).resolve()),
+                             anon_cmd=str(Path(args.anon_cmd).resolve()) if args.anon_cmd else None),
             encoding="utf-8")
         sh_path.chmod(0o755)
 

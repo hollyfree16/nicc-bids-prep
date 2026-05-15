@@ -285,7 +285,7 @@ def resolve_series(series_list, template):
         if cf not in rerun_base_cf and is_rerun(desc):
             rerun_base_cf[cf] = strip_rerun(desc).casefold()
     for cf, base_cf in rerun_base_cf.items():
-        if base_cf in desc_cf:
+        if cf in desc_cf and base_cf in desc_cf:
             superseded_cf.add(base_cf)
 
     records = []

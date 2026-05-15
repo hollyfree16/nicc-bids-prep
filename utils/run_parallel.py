@@ -32,19 +32,23 @@ def run_command(cmd, index, total):
     if not cmd or cmd.startswith("#"):
         return index, 0, cmd
 
-    print(f"[{index}/{total}] Starting: {cmd[:80]}...")
+    print(f"[{index}/{total}] Starting: {cmd}")
     start = datetime.now()
 
     if LOG_DIR:
         log_path = LOG_DIR / f"{_log_name(cmd, index)}.log"
         with open(log_path, "w") as lf:
             result = subprocess.run(cmd, shell=True, stdout=lf, stderr=subprocess.STDOUT)
+        if result.returncode != 0:
+            fail_path = log_path.with_suffix(".FAIL")
+            log_path.rename(fail_path)
+            log_path = fail_path
     else:
         result = subprocess.run(cmd, shell=True)
 
     elapsed = (datetime.now() - start).total_seconds()
     status = "✓" if result.returncode == 0 else "✗ FAILED"
-    print(f"[{status}] ({elapsed:.1f}s) [{index}/{total}] {cmd[:80]}")
+    print(f"[{status}] ({elapsed:.1f}s) [{index}/{total}] {cmd}")
     return index, result.returncode, cmd
 
 def main():

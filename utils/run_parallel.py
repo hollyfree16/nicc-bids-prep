@@ -19,13 +19,34 @@ LOG_DIR = Path(args.log_dir) if args.log_dir else None
 if LOG_DIR:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-_SH_RE = re.compile(r'(\S+\.sh)\b')
+_SH_RE      = re.compile(r'(\S+\.sh)\b')
+_SUBJECT_RE = re.compile(r'--subject-id\s+(\S+)')
+_SESSION_RE = re.compile(r'--session-id\s+(\S+)')
+
 
 def _log_name(cmd: str, index: int) -> str:
+    # 1. Python commands with --subject-id / --session-id  (dcm2dir style)
+    subj_m = _SUBJECT_RE.search(cmd)
+    ses_m  = _SESSION_RE.search(cmd)
+    if subj_m:
+        subj = subj_m.group(1)          # e.g. sub-MGHL2p003
+        ses  = ses_m.group(1) if ses_m else None
+        # derive the script name from the last token of the python path
+        script_tok = Path(cmd.split()[1]).name if len(cmd.split()) > 1 else "cmd"
+        parts = [subj]
+        if ses:
+            parts.append(ses)
+        parts.append(script_tok)        # e.g. dcm2dir
+        return "_".join(parts)          # sub-MGHL2p003_ses-002_dcm2dir
+
+    # 2. Shell scripts  (original behaviour)
     m = _SH_RE.search(cmd)
     if m:
-        return Path(m.group(1)).stem
+        return Path(m.group(1)).stem    # e.g. sub-MGHL2p003_ses-002_BIDS
+
+    # 3. Fallback
     return f"cmd_{index:04d}"
+
 
 def run_command(cmd, index, total):
     cmd = cmd.strip()

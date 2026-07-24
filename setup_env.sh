@@ -11,7 +11,7 @@ python3 -m venv "$VENV"
 
 echo "Installing packages ..."
 "$VENV/bin/pip" install --upgrade pip --quiet
-"$VENV/bin/pip" install heudiconv pydicom
+"$VENV/bin/pip" install heudiconv pydicom pyyaml
 
 echo "Patching heudiconv date check ..."
 "$VENV/bin/python3" - "$VENV" <<'PYEOF'

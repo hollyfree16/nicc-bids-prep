@@ -1,43 +1,65 @@
 # bids-prep
 
-Shared neuroimaging utilities for DICOM inspection and BIDS conversion.
+Shared neuroimaging utilities for DICOM inspection and BIDS conversion. See
+`CLAUDE.md` for the full pipeline walkthrough, template format, and script
+behaviors.
 
 ## Structure
 
 ```
 bids-prep/
+├── run_pipeline.py                 # Config-driven step runner for the whole pipeline (see below)
+├── configs/
+│   └── example.yaml / example.json # Example run_pipeline.py config — copy per site
 ├── bids/
-│   ├── heuristic.py               # HeuDiConv heuristic — reads per-subject mapping.tsv
-│   ├── generate_bids_configs.py   # Generates per-subject mapping.tsv + BIDS.sh from a protocol template
-│   └── templates/                 # Protocol TSV templates (one per site/protocol)
-└── dicom/
-    ├── query_series.py            # List unique SeriesDescriptions from a DICOM directory
-    ├── query_study_dates.py       # List study dates per subject from a DICOM directory
-    ├── run_parallel.py            # Run a file of shell commands in parallel
-    └── dcm2dir                    # Sort messy DICOMs into a structured directory
+│   ├── heuristic.py                # HeuDiConv heuristic — reads per-subject mapping.tsv
+│   ├── generate_bids_configs.py    # Generates per-subject mapping.tsv + BIDS.sh from a protocol template
+│   └── templates/                  # Protocol TSV templates (one per site/protocol)
+├── dicom/
+│   ├── dcm2dir                     # Sort messy DICOMs into a structured directory
+│   ├── query_series.py             # Per-subject/session DICOM series TSV inventory
+│   ├── concat_series_tsvs.py       # Merge per-subject series TSVs into one cohort TSV
+│   └── core_protocol_discovery.py  # Protocol triage + year-specific candidate templates
+└── utils/
+    ├── run_parallel.py             # Run a file of shell commands in parallel
+    ├── run_subject.py              # Run+log a single generated _BIDS.sh
+    └── strip_dates.py              # Strip dates from BIDS sidecar JSON
 ```
 
 ## Usage
 
+### run_pipeline.py (recommended entry point)
+Wraps the scripts below as subprocesses driven by a config file, so
+per-site parameters only need to be written once. See `CLAUDE.md` →
+"Pipeline Orchestration" for the full step registry and config schema.
+
+```bash
+python run_pipeline.py --config configs/MGH.yaml --steps 6
+python run_pipeline.py --config configs/MGH.yaml --steps "1 2 3"
+python run_pipeline.py --list-steps
+```
+
 ### query_series.py
 ```bash
 python dicom/query_series.py \
-    --input-dir /path/to/dicom/sub-001 \
-    --output-txt sub-001_series.txt
+    --input-dir /path/to/dicom/sub-001/ses-001 \
+    --output-dir /path/to/series/logs
 ```
 
-### query_study_dates.py
+### concat_series_tsvs.py
 ```bash
-python dicom/query_study_dates.py \
-    --input-dir /path/to/dicom/root \
-    --output-txt study_dates.txt
+python dicom/concat_series_tsvs.py \
+    --input-dir /path/to/series/logs \
+    --output-tsv all_ses-001_series.tsv \
+    --sort
 ```
 
-### run_parallel.py
+### core_protocol_discovery.py
 ```bash
-python dicom/run_parallel.py \
-    --script-file commands.sh \
-    --max-workers 8
+python dicom/core_protocol_discovery.py \
+    --input all_ses-001_series.tsv \
+    --output-dir review_out \
+    --site MYSITE
 ```
 
 ### generate_bids_configs.py
@@ -50,6 +72,15 @@ python bids/generate_bids_configs.py \
     --heuristic      bids/heuristic.py \
     --dicom_template /path/to/raw/mri/sub-{subject}/ses-{session}/*/*.dcm \
     --bids_output    /path/to/BIDS/
+```
+Batch mode is incremental: subjects whose `<tag>_mapping.tsv` is already up
+to date are skipped. Pass `--force`/`--reprocess` to regenerate everyone.
+
+### utils/run_parallel.py
+```bash
+python utils/run_parallel.py \
+    --script-file commands.sh \
+    --max-workers 8
 ```
 
 ## Adding to a project as a Git submodule

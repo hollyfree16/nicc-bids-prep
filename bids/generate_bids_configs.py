@@ -37,7 +37,19 @@ Usage
         [--templates_dir /code/heudiconv_v1.3.3/templates] \
         [--heuristic     /code/heudiconv_v1.3.3/heuristic.py] \
         [--dicom_template "raw/mri/sub-{subject}/ses-{session}/*/*.dcm"] \
-        [--bids_output   /BIDS/]
+        [--bids_output   /BIDS/] \
+        [--force]
+
+Incremental processing
+-----------------------
+In batch mode (no --subject), a subject is skipped if its <tag>_mapping.tsv
+already exists and is newer than its *_series.tsv (logged as [SKIP]). If the
+series log is newer than the existing mapping.tsv, the subject is
+automatically reprocessed (logged as [REPROCESS-STALE]). Pass --force /
+--reprocess to reprocess every subject regardless. Skipping a subject also
+carries its existing rows forward unchanged in the site-level aggregate
+files below, so running with --subject (or a batch run where most subjects
+are already up to date) no longer erases other subjects from those files.
 
 Outputs per subject  (<output_dir>/sub-<subject>_ses-<session>/)
 ----------------------------------------------------------------
@@ -48,11 +60,11 @@ Outputs per subject  (<output_dir>/sub-<subject>_ses-<session>/)
 
 Site-level review files  (<output_dir>/)
 ----------------------------------------
-    00_summary_all.tsv         all subjects x all series
+    00_summary_all.tsv         all subjects x all series (merged across runs)
     01_flagged_unknowns.tsv    series not in template and not always-ignored
     02_superseded_by_rerun.tsv bases suppressed by rerun versions
-    03_incomplete_sessions.tsv subjects missing expected sequences
-    04_protocol_detection.tsv  template matched + confidence per subject
+    03_incomplete_sessions.tsv subjects missing expected sequences (merged across runs)
+    04_protocol_detection.tsv  template matched + confidence per subject (merged across runs)
 """
 
 import argparse
@@ -494,6 +506,19 @@ def parse_log(log_path):
             if ln.strip()]
 
 
+def read_existing_tsv(path):
+    """Read a previously-written site-level aggregate TSV. Returns [] if absent."""
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f, delimiter="\t"))
+
+
+def row_tag(row):
+    subject, session = row.get("subject", ""), row.get("session", "")
+    return f"sub-{subject}_ses-{session}" if session else f"sub-{subject}"
+
+
 def parse_filename(log_path):
     m = re.search(r"sub-([A-Za-z0-9]+)_ses-([A-Za-z0-9]+)", log_path.stem, re.IGNORECASE)
     if m:
@@ -520,6 +545,10 @@ def main():
     parser.add_argument("--bids_output",    required=True, help="BIDS output directory")
     parser.add_argument("--dcmconfig",      dest="dcmconfig", default=None,
                         help="Path to dcm2niix config JSON passed to heudiconv --dcmconfig (e.g. utils/dcmconfig_bids_anon.json)")
+    parser.add_argument("--force", "--reprocess", dest="force", action="store_true",
+                        help="Reprocess every subject even if <tag>_mapping.tsv is already up to date. "
+                             "Without this, subjects whose mapping.tsv is newer than their *_series.tsv "
+                             "are skipped (compute-saving for large/incremental datasets).")
     args = parser.parse_args()
 
     logs_dir      = Path(args.logs_dir)
@@ -556,6 +585,8 @@ def main():
     print(f"{'─'*60}\n")
 
     summary_rows, detection_rows, incomplete_rows = [], [], []
+    processed_tags = set()
+    n_skipped_uptodate = 0
 
     n_skipped_site = 0
     for log_path in log_files:
@@ -564,16 +595,26 @@ def main():
             print(f"  SKIP (cannot parse subject): {log_path.name}")
             continue
 
+        tag = f"sub-{subject}_ses-{session}" if session else f"sub-{subject}"
+
+        mapping_path = output_dir / tag / f"{tag}_mapping.tsv"
+        if mapping_path.exists() and not args.force:
+            if mapping_path.stat().st_mtime >= log_path.stat().st_mtime:
+                print(f"  [SKIP] {tag}: mapping.tsv up to date")
+                n_skipped_uptodate += 1
+                continue
+            print(f"  [REPROCESS-STALE] {tag}: series log newer than mapping.tsv")
+
         if log_path.suffix == ".tsv":
             series_list, scan_year = parse_series_tsv(log_path)
         else:
             series_list, scan_year = parse_log(log_path), None
 
-        tag = f"sub-{subject}_ses-{session}" if session else f"sub-{subject}"
-
         if not series_list:
             print(f"  SKIP (empty): {tag}")
             continue
+
+        processed_tags.add(tag)
 
         tmpl, score = detect_protocol(series_list, templates, scan_year=scan_year)
 
@@ -642,6 +683,8 @@ def main():
         print(f"  [{tag}]  {status_str}")
 
     sf = ["subject", "session", "series_description", "status", "folder", "bids_key", "is_rerun", "note"]
+    inc_f = ["tag", "subject", "session", "missing_sequence"]
+    det_f = ["tag", "subject", "session", "template", "confidence", "flag"]
 
     def write_tsv(path, fields, rows):
         with path.open("w", newline="", encoding="utf-8") as f:
@@ -649,28 +692,48 @@ def main():
             w.writeheader()
             w.writerows(rows)
 
-    write_tsv(output_dir / "00_summary_all.tsv",         sf, summary_rows)
-    write_tsv(output_dir / "01_flagged_unknowns.tsv",    sf, [r for r in summary_rows if r["status"] == "unknown"])
-    write_tsv(output_dir / "02_superseded_by_rerun.tsv", sf, [r for r in summary_rows if r["status"] == "superseded"])
-    write_tsv(output_dir / "03_incomplete_sessions.tsv",
-              ["tag", "subject", "session", "missing_sequence"], incomplete_rows)
-    write_tsv(output_dir / "04_protocol_detection.tsv",
-              ["tag", "subject", "session", "template", "confidence", "flag"], detection_rows)
+    # Merge this run's rows with any carried-forward rows for subjects that were
+    # skipped (up to date) this run, so a partial/incremental run doesn't erase
+    # previously-processed subjects from the site-level aggregate files.
+    old_summary    = read_existing_tsv(output_dir / "00_summary_all.tsv")
+    old_incomplete = read_existing_tsv(output_dir / "03_incomplete_sessions.tsv")
+    old_detection  = read_existing_tsv(output_dir / "04_protocol_detection.tsv")
 
-    n_inc = len(set(r["tag"] for r in incomplete_rows))
+    merged_summary = (
+        [r for r in old_summary if row_tag(r) not in processed_tags] + summary_rows
+    )
+    merged_incomplete = (
+        [r for r in old_incomplete if r["tag"] not in processed_tags] + incomplete_rows
+    )
+    merged_detection = (
+        [r for r in old_detection if r["tag"] not in processed_tags] + detection_rows
+    )
+    merged_summary.sort(key=lambda r: (r["subject"], r["session"]))
+    merged_incomplete.sort(key=lambda r: (r["subject"], r["session"]))
+    merged_detection.sort(key=lambda r: (r["subject"], r["session"]))
+
+    write_tsv(output_dir / "00_summary_all.tsv",         sf, merged_summary)
+    write_tsv(output_dir / "01_flagged_unknowns.tsv",    sf, [r for r in merged_summary if r["status"] == "unknown"])
+    write_tsv(output_dir / "02_superseded_by_rerun.tsv", sf, [r for r in merged_summary if r["status"] == "superseded"])
+    write_tsv(output_dir / "03_incomplete_sessions.tsv", inc_f, merged_incomplete)
+    write_tsv(output_dir / "04_protocol_detection.tsv",  det_f, merged_detection)
+
+    n_inc = len(set(r["tag"] for r in merged_incomplete))
     print(f"""
 {'─'*60}
 Output directory   : {output_dir}
 Site               : {args.site}
 Series files found : {len(log_files)}
 Skipped (wrong site): {n_skipped_site}
-Subjects processed : {len(detection_rows)}
-Total series       : {len(summary_rows)}
+Skipped (up to date): {n_skipped_uptodate}
+Subjects processed this run : {len(detection_rows)}
+Subjects in aggregate total : {len(merged_detection)}
+Total series (this run)     : {len(summary_rows)}
   kept             : {sum(1 for r in summary_rows if r['status'] == 'keep')}
   ignored          : {sum(1 for r in summary_rows if r['status'] == 'ignore')}
   superseded       : {sum(1 for r in summary_rows if r['status'] == 'superseded')}
   unknown          : {sum(1 for r in summary_rows if r['status'] == 'unknown')}
-Incomplete sessions: {n_inc}
+Incomplete sessions (aggregate): {n_inc}
 
 Per-subject files (in each sub-*/ses-* folder)
   <tag>_mapping.tsv          heudiconv mapping input

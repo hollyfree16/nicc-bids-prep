@@ -1,0 +1,65 @@
+# Example run_pipeline.py config. Copy this per site (e.g. configs/MGH.yaml)
+# and fill in real paths. `site` at the top level is inherited by every step
+# below unless a step overrides it.
+#
+# Usage:
+#   python run_pipeline.py --config configs/MGH.yaml --steps 6
+#   python run_pipeline.py --config configs/MGH.yaml --steps "1 2 3"
+#   python run_pipeline.py --config configs/MGH.yaml --steps 1-4 --dry-run
+#
+# --subject/--session are passed on the CLI, not stored here, since they
+# vary per invocation for steps 1/2/6.
+
+site: MGH
+
+steps:
+
+  # Step 1 -- dicom/dcm2dir. Always single subject/session; --subject/--session
+  # come from the CLI. Fan out over many subjects with utils/run_parallel.py.
+  dcm2dir:
+    input_dir: /data/MGH/dicom_incoming
+    output_dir: /data/MGH/raw_sorted
+    mode: copy              # copy | move | link
+    skip_md5: false
+    verbose: false
+
+  # Step 2 -- dicom/query_series.py. Batch mode walks sub-*/ses-* under input_dir.
+  query_series:
+    input_dir: /data/MGH/raw_sorted
+    output_dir: /data/MGH/series_logs
+    batch: true
+    session_filter: [ses-001]
+    check_instances: false
+    force: false             # true = regenerate every subject's TSV even if it exists
+
+  # Step 3 -- dicom/concat_series_tsvs.py. Whole-cohort; no --subject.
+  concat_series_tsvs:
+    input_dir: /data/MGH/series_logs
+    output_tsv: /data/MGH/all_ses-001_series.tsv
+    sort: true
+
+  # Step 4 -- dicom/core_protocol_discovery.py. Whole-cohort; no --subject.
+  core_protocol_discovery:
+    input: /data/MGH/all_ses-001_series.tsv
+    output_dir: /data/MGH/protocol_review
+    year: [2021, 2022, 2023, 2024, 2025]
+    core_threshold: 0.80
+    protocol_name: null       # defaults to "{site} {year_range}" if unset
+
+  # Step 5 -- manual review checkpoint (no script). Just tells you where to
+  # go fill in bids_folder/bids_suffix/fingerprint/expected/is_rerun/rerun_of.
+  manual_review:
+    templates_dir: /data/MGH/protocol_review/templates
+
+  # Step 6 -- bids/generate_bids_configs.py. Incremental: subjects whose
+  # mapping.tsv is already up to date are skipped. Pass --force on the CLI,
+  # or set force: true here, to reprocess everyone.
+  generate_bids_configs:
+    logs_dir: /data/MGH/series_logs
+    output_dir: /data/MGH/bids_configs
+    templates_dir: /data/MGH/protocol_review/templates
+    heuristic: bids/heuristic.py
+    dicom_template: "/data/MGH/raw_sorted/sub-{subject}/ses-{session}/*/*.dcm"
+    bids_output: /data/BIDS/MGH
+    dcmconfig: utils/dcmconfig_bids_anon.json
+    force: false

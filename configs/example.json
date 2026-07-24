@@ -1,0 +1,53 @@
+{
+  "_readme": "Zero-dependency fallback for configs/example.yaml (no PyYAML required). Same schema: top-level 'site' is inherited by every step in 'steps'. --subject/--session are CLI-only, not stored here. See configs/example.yaml for per-field comments.",
+
+  "site": "MGH",
+
+  "steps": {
+    "dcm2dir": {
+      "input_dir": "/data/MGH/dicom_incoming",
+      "output_dir": "/data/MGH/raw_sorted",
+      "mode": "copy",
+      "skip_md5": false,
+      "verbose": false
+    },
+
+    "query_series": {
+      "input_dir": "/data/MGH/raw_sorted",
+      "output_dir": "/data/MGH/series_logs",
+      "batch": true,
+      "session_filter": ["ses-001"],
+      "check_instances": false,
+      "force": false
+    },
+
+    "concat_series_tsvs": {
+      "input_dir": "/data/MGH/series_logs",
+      "output_tsv": "/data/MGH/all_ses-001_series.tsv",
+      "sort": true
+    },
+
+    "core_protocol_discovery": {
+      "input": "/data/MGH/all_ses-001_series.tsv",
+      "output_dir": "/data/MGH/protocol_review",
+      "year": [2021, 2022, 2023, 2024, 2025],
+      "core_threshold": 0.80,
+      "protocol_name": null
+    },
+
+    "manual_review": {
+      "templates_dir": "/data/MGH/protocol_review/templates"
+    },
+
+    "generate_bids_configs": {
+      "logs_dir": "/data/MGH/series_logs",
+      "output_dir": "/data/MGH/bids_configs",
+      "templates_dir": "/data/MGH/protocol_review/templates",
+      "heuristic": "bids/heuristic.py",
+      "dicom_template": "/data/MGH/raw_sorted/sub-{subject}/ses-{session}/*/*.dcm",
+      "bids_output": "/data/BIDS/MGH",
+      "dcmconfig": "utils/dcmconfig_bids_anon.json",
+      "force": false
+    }
+  }
+}

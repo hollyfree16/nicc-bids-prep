@@ -38,7 +38,8 @@ Usage
         [--heuristic     /code/heudiconv_v1.3.3/heuristic.py] \
         [--dicom_template "raw/mri/sub-{subject}/ses-{session}/*/*.dcm"] \
         [--bids_output   /BIDS/] \
-        [--force]
+        [--force] \
+        [--queue-file    /path/to/bids_queue.sh]
 
 Incremental processing
 -----------------------
@@ -50,6 +51,18 @@ automatically reprocessed (logged as [REPROCESS-STALE]). Pass --force /
 carries its existing rows forward unchanged in the site-level aggregate
 files below, so running with --subject (or a batch run where most subjects
 are already up to date) no longer erases other subjects from those files.
+
+Conversion queue
+----------------
+Every run writes/updates a `bids_queue.sh` (default: <output_dir>/bids_queue.sh,
+override with --queue-file) listing `bash <tag>_BIDS.sh` for every subject
+that either (a) doesn't have NIfTI data at --bids_output yet, or (b) had its
+config (re)generated this run. Subjects that are both already converted and
+unchanged this run are left out. Feed it straight to
+utils/run_parallel.py --script-file, or `bash bids_queue.sh` to run it
+directly. If --queue-file points at a path shared across multiple
+site/session invocations, only this run's own --output_dir's entries are
+refreshed -- other runs' pending entries already in the file are preserved.
 
 Outputs per subject  (<output_dir>/sub-<subject>_ses-<session>/)
 ----------------------------------------------------------------
@@ -65,6 +78,7 @@ Site-level review files  (<output_dir>/)
     02_superseded_by_rerun.tsv bases suppressed by rerun versions
     03_incomplete_sessions.tsv subjects missing expected sequences (merged across runs)
     04_protocol_detection.tsv  template matched + confidence per subject (merged across runs)
+    bids_queue.sh              subjects needing heudiconv conversion (merged across runs)
 """
 
 import argparse
@@ -506,6 +520,32 @@ def parse_log(log_path):
             if ln.strip()]
 
 
+def bids_output_exists(bids_output, subject, session):
+    """True if --bids_output already has converted NIfTI data for this subject/session."""
+    base = Path(bids_output) / f"sub-{subject}"
+    if session:
+        base = base / f"ses-{session}"
+    return base.is_dir() and any(base.rglob("*.nii*"))
+
+
+def write_queue_file(queue_path, own_output_dir, new_lines):
+    """Merge new_lines into queue_path, replacing only entries that belong to
+    own_output_dir (so a shared queue file across multiple site/session runs
+    keeps other runs' pending entries untouched)."""
+    own_prefix = str(Path(own_output_dir).resolve())
+    existing = []
+    if queue_path.exists():
+        existing = [ln for ln in queue_path.read_text(encoding="utf-8").splitlines()
+                    if ln.strip() and not ln.startswith("#!")]
+    kept = [ln for ln in existing if own_prefix not in ln]
+    lines = kept + new_lines
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    text = "#!/bin/bash\n" + "\n".join(lines) + ("\n" if lines else "")
+    queue_path.write_text(text, encoding="utf-8")
+    queue_path.chmod(0o755)
+    return len(lines)
+
+
 def read_existing_tsv(path):
     """Read a previously-written site-level aggregate TSV. Returns [] if absent."""
     if not path.exists():
@@ -549,6 +589,13 @@ def main():
                         help="Reprocess every subject even if <tag>_mapping.tsv is already up to date. "
                              "Without this, subjects whose mapping.tsv is newer than their *_series.tsv "
                              "are skipped (compute-saving for large/incremental datasets).")
+    parser.add_argument("--queue-file", dest="queue_file", default=None,
+                        help="Path to write the BIDS-conversion queue script (default: "
+                             "<output_dir>/bids_queue.sh). Lists `bash <tag>_BIDS.sh` for every subject "
+                             "that doesn't have BIDS data at --bids_output yet, or whose config changed "
+                             "this run. Can point at a shared path across multiple site/session runs -- "
+                             "only this run's own output_dir's entries are refreshed, other runs' entries "
+                             "already in the file are left alone.")
     args = parser.parse_args()
 
     logs_dir      = Path(args.logs_dir)
@@ -586,6 +633,7 @@ def main():
 
     summary_rows, detection_rows, incomplete_rows = [], [], []
     processed_tags = set()
+    seen_tags = []  # (tag, subject, session) for every subject considered this run
     n_skipped_uptodate = 0
 
     n_skipped_site = 0
@@ -596,6 +644,7 @@ def main():
             continue
 
         tag = f"sub-{subject}_ses-{session}" if session else f"sub-{subject}"
+        seen_tags.append((tag, subject, session))
 
         mapping_path = output_dir / tag / f"{tag}_mapping.tsv"
         if mapping_path.exists() and not args.force:
@@ -718,6 +767,21 @@ def main():
     write_tsv(output_dir / "03_incomplete_sessions.tsv", inc_f, merged_incomplete)
     write_tsv(output_dir / "04_protocol_detection.tsv",  det_f, merged_detection)
 
+    # Conversion queue: subjects that don't have BIDS data at --bids_output yet,
+    # or whose config was (re)generated this run (so any prior conversion may be stale).
+    queue_lines = []
+    for tag, subject, session in seen_tags:
+        sh_path = output_dir / tag / f"{tag}_BIDS.sh"
+        if not sh_path.exists():
+            continue
+        needs_conversion = (tag in processed_tags
+                            or not bids_output_exists(args.bids_output, subject, session))
+        if needs_conversion:
+            queue_lines.append(f"bash {sh_path.resolve()}")
+
+    queue_path = Path(args.queue_file) if args.queue_file else output_dir / "bids_queue.sh"
+    n_queued = write_queue_file(queue_path, output_dir, queue_lines)
+
     n_inc = len(set(r["tag"] for r in merged_incomplete))
     print(f"""
 {'─'*60}
@@ -734,6 +798,8 @@ Total series (this run)     : {len(summary_rows)}
   superseded       : {sum(1 for r in summary_rows if r['status'] == 'superseded')}
   unknown          : {sum(1 for r in summary_rows if r['status'] == 'unknown')}
 Incomplete sessions (aggregate): {n_inc}
+Conversion queue    : {len(queue_lines)} subject(s) need heudiconv this run -> {queue_path}
+                      ({n_queued} total pending in that file)
 
 Per-subject files (in each sub-*/ses-* folder)
   <tag>_mapping.tsv          heudiconv mapping input
@@ -747,6 +813,7 @@ Site-level review files
   02_superseded_by_rerun.tsv rerun superseding log
   03_incomplete_sessions.tsv subjects missing expected sequences
   04_protocol_detection.tsv  template match + confidence per subject
+  bids_queue.sh              `bash <tag>_BIDS.sh` for every subject needing conversion
 {'─'*60}
 """)
 

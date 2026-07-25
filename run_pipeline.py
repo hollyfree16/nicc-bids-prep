@@ -203,7 +203,7 @@ def args_generate_bids_configs(cfg, subject, session):
         argv += ["--session", session]
     for key, flag in [("templates_dir", "--templates_dir"), ("heuristic", "--heuristic"),
                        ("dicom_template", "--dicom_template"), ("bids_output", "--bids_output"),
-                       ("dcmconfig", "--dcmconfig")]:
+                       ("dcmconfig", "--dcmconfig"), ("queue_file", "--queue-file")]:
         if cfg.get(key):
             argv += [flag, str(cfg[key])]
     if cfg.get("force"):

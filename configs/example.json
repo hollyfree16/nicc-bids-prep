@@ -47,7 +47,8 @@
       "dicom_template": "/data/MGH/raw_sorted/sub-{subject}/ses-{session}/*/*.dcm",
       "bids_output": "/data/BIDS/MGH",
       "dcmconfig": "utils/dcmconfig_bids_anon.json",
-      "force": false
+      "force": false,
+      "queue_file": "/data/MGH/bids_configs/bids_queue.sh"
     }
   }
 }

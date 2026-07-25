@@ -63,3 +63,8 @@ steps:
     bids_output: /data/BIDS/MGH
     dcmconfig: utils/dcmconfig_bids_anon.json
     force: false
+    # Optional: where to write the bash_queue.sh conversion queue. Defaults to
+    # <output_dir>/bids_queue.sh. Point multiple sites/sessions at the same
+    # shared path to accumulate one combined queue -- each run only refreshes
+    # its own output_dir's entries.
+    queue_file: /data/MGH/bids_configs/bids_queue.sh

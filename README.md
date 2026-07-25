@@ -75,6 +75,10 @@ python bids/generate_bids_configs.py \
 ```
 Batch mode is incremental: subjects whose `<tag>_mapping.tsv` is already up
 to date are skipped. Pass `--force`/`--reprocess` to regenerate everyone.
+Every run also writes/updates `<output_dir>/bids_queue.sh` — a `bash
+<tag>_BIDS.sh` line for each subject that still needs converting (no BIDS
+data yet, or config changed this run) — ready to feed to
+`utils/run_parallel.py --script-file` or run directly with `bash`.
 
 ### utils/run_parallel.py
 ```bash
